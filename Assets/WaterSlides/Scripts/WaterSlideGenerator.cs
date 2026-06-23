@@ -45,6 +45,9 @@ namespace WaterSlides
         [Header("Runtime")]
         public bool GenerateCollider = true;
 
+        [Tooltip("Keep up/over vertical motion (vertical loops). Disables the 'always descend' clamp on the mesh path.")]
+        public bool PreserveVerticalMotion;
+
         MeshFilter _meshFilter;
         MeshRenderer _meshRenderer;
         MeshCollider _meshCollider;
@@ -53,6 +56,39 @@ namespace WaterSlides
         public Vector3 StartPosition => ControlPoints.Count > 0 ? ControlPoints[0] : transform.position;
         public Vector3 EndPosition => ControlPoints.Count > 0 ? ControlPoints[^1] : transform.position;
         public Vector3 EndTangent => WaterSlideMeshBuilder.GetPathEndTangent(ControlPoints);
+
+        // World-space endpoints of the ACTUAL rendered centreline (after smoothing + descent
+        // clamping). The mesh can push the end lower than the raw control point, so connections
+        // must use these to stay aligned with what is drawn.
+        public Vector3 ProcessedWorldStart
+        {
+            get
+            {
+                var p = WaterSlideMeshBuilder.BuildProcessedPath(GetWorldControlPoints(), BuildSettings());
+                return p.Count > 0 ? p[0] : transform.TransformPoint(StartPosition);
+            }
+        }
+
+        public Vector3 ProcessedWorldEnd
+        {
+            get
+            {
+                var p = WaterSlideMeshBuilder.BuildProcessedPath(GetWorldControlPoints(), BuildSettings());
+                return p.Count > 0 ? p[^1] : transform.TransformPoint(EndPosition);
+            }
+        }
+
+        public Vector3 ProcessedWorldEndTangent
+        {
+            get
+            {
+                var p = WaterSlideMeshBuilder.BuildProcessedPath(GetWorldControlPoints(), BuildSettings());
+                if (p.Count < 2)
+                    return transform.TransformDirection(EndTangent);
+                var dir = p[^1] - p[^2];
+                return dir.sqrMagnitude > 1e-6f ? dir.normalized : Vector3.forward;
+            }
+        }
 
         void OnEnable()
         {
@@ -122,6 +158,7 @@ namespace WaterSlides
             RingSegments = RingSegments,
             SamplesPerSegment = SamplesPerSegment,
             BankStrength = BankStrength,
+            PreserveVerticalMotion = PreserveVerticalMotion,
             ClosedTube = new SlideCrossSection.ClosedTube { Radius = TubeRadius },
             OpenFlume = new SlideCrossSection.OpenFlume
             {

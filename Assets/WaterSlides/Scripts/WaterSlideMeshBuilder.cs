@@ -12,19 +12,59 @@ namespace WaterSlides
             public int RingSegments;
             public int SamplesPerSegment;
             public float BankStrength;
+            public bool PreserveVerticalMotion;
 
             public SlideCrossSection.OpenFlume OpenFlume;
             public SlideCrossSection.ClosedTube ClosedTube;
         }
 
-        public static Mesh BuildTube(IReadOnlyList<Vector3> controlPoints, Settings settings)
+        // The exact centreline the mesh is built on (after smoothing + descent clamping).
+        // Use this for connecting slides so the jump lines up with what is actually rendered.
+        public static List<Vector3> BuildProcessedPath(IReadOnlyList<Vector3> controlPoints, Settings settings)
         {
             var path = SamplePath(controlPoints, settings.SamplesPerSegment);
             if (path.Count < 2)
+                return path;
+
+            path = StabilizePath(path, clampY: !settings.PreserveVerticalMotion);
+            if (!settings.PreserveVerticalMotion)
+                EnforcePathMonotonicDescent(path);
+
+            float clearance = settings.Enclosure == SlideEnclosure.Open
+                ? Mathf.Max(settings.OpenFlume.Width, 0.9f)
+                : Mathf.Max(settings.ClosedTube.Radius * 2f + settings.WallThickness * 2f, 0.9f);
+            RemoveSampledLoops(path, clearance);
+            return path;
+        }
+
+        // Removes tiny self-intersecting loops the spline can form at hard turns: if a later sample
+        // comes back within one tube-width of an earlier one, the points between them form a loop
+        // that is cut out. Real loops stay clear in 3D (helix pitch / corkscrew offset) so survive.
+        static void RemoveSampledLoops(List<Vector3> path, float clearance)
+        {
+            if (path.Count < 5)
+                return;
+
+            float sqr = clearance * clearance;
+            for (int i = 0; i < path.Count - 4; i++)
+            {
+                for (int j = i + 4; j < path.Count; j++)
+                {
+                    if ((path[j] - path[i]).sqrMagnitude < sqr)
+                    {
+                        path.RemoveRange(i + 1, j - i - 1);
+                        break;
+                    }
+                }
+            }
+        }
+
+        public static Mesh BuildTube(IReadOnlyList<Vector3> controlPoints, Settings settings)
+        {
+            var path = BuildProcessedPath(controlPoints, settings);
+            if (path.Count < 2)
                 return null;
 
-            path = StabilizePath(path);
-            EnforcePathMonotonicDescent(path);
             var frames = BuildFrames(path, settings.BankStrength, settings.Enclosure);
             int ringVerts = settings.RingSegments;
             int rings = path.Count;
@@ -95,12 +135,10 @@ namespace WaterSlides
 
         public static Mesh BuildRideSurface(IReadOnlyList<Vector3> controlPoints, Settings settings)
         {
-            var path = SamplePath(controlPoints, settings.SamplesPerSegment);
+            var path = BuildProcessedPath(controlPoints, settings);
             if (path.Count < 2)
                 return null;
 
-            path = StabilizePath(path);
-            EnforcePathMonotonicDescent(path);
             var frames = BuildFrames(path, settings.BankStrength, settings.Enclosure);
             int ringVerts = settings.RingSegments;
             int rings = path.Count;
@@ -253,7 +291,7 @@ namespace WaterSlides
             public Vector3 Up;
         }
 
-        static List<Vector3> StabilizePath(List<Vector3> path)
+        static List<Vector3> StabilizePath(List<Vector3> path, bool clampY)
         {
             if (path.Count < 3)
                 return path;
@@ -267,9 +305,12 @@ namespace WaterSlides
                 {
                     var mid = (result[i - 1] + result[i + 1]) * 0.5f;
                     var smoothed = Vector3.Lerp(result[i], mid, 0.22f);
-                    float maxY = Mathf.Min(result[i].y, result[i - 1].y);
-                    if (smoothed.y > maxY)
-                        smoothed.y = maxY;
+                    if (clampY)
+                    {
+                        float maxY = Mathf.Min(result[i].y, result[i - 1].y);
+                        if (smoothed.y > maxY)
+                            smoothed.y = maxY;
+                    }
                     result[i] = smoothed;
                 }
             }

@@ -67,6 +67,22 @@ namespace WaterSlides
         [Tooltip("Разрешить спирали на закрытых трубах (экспериментально, может давать петли).")]
         public bool AllowLoopsAndSpirals = false;
 
+        [Header("Loops")]
+        [Tooltip("Добавлять петли некоторым горкам (не всем).")]
+        public bool EnableLoops = true;
+
+        [Tooltip("Вероятность того, что у горки будет петля.")]
+        [Range(0f, 1f)] public float LoopChancePerSlide = 0.4f;
+
+        [Tooltip("Разрешить вертикальные петли (труба идёт вверх и через верх). Только закрытые трубы.")]
+        public bool AllowVerticalLoops = true;
+
+        [Tooltip("Разрешить горизонтальные петли (полный круг с плавным спуском). Открытые и закрытые.")]
+        public bool AllowHorizontalLoops = true;
+
+        [Tooltip("Радиус петель (метры).")]
+        public FloatRange LoopRadius = new() { Min = 3.5f, Max = 6f };
+
         [Header("Closed Tube — Per Slide Ranges")]
         public FloatRange TubeRadius = new() { Min = 0.45f, Max = 0.6f };
         public FloatRange WallThickness = new() { Min = 0.06f, Max = 0.1f };
@@ -153,6 +169,12 @@ namespace WaterSlides
             {
                 var slideRng = new System.Random(rng.Next());
                 var enclosure = PickEnclosure(slideRng, i);
+
+                var loopKind = PickLoopKind(slideRng, i);
+                // A vertical loop goes upside-down, so it must be a closed tube.
+                if (loopKind == SlideLoopKind.Vertical)
+                    enclosure = SlideEnclosure.Closed;
+
                 var openShape = enclosure == SlideEnclosure.Open ? PickOpenShape(slideRng) : OpenFlumeShape.Square;
 
                 Vector3 worldEntry = i == 0
@@ -165,7 +187,8 @@ namespace WaterSlides
                 // transformed again by the GameObject (that would double-transform / scatter it).
                 slideGo.transform.SetPositionAndRotation(Vector3.zero, Quaternion.identity);
 
-                var worldPath = BuildSlidePathWorld(slideRng, enclosure, cursorPos, worldEntry, i > 0);
+                float loopRadius = LoopRadius.Sample(slideRng);
+                var worldPath = BuildSlidePathWorld(slideRng, enclosure, cursorPos, worldEntry, i > 0, loopKind, loopRadius);
 
                 var slide = slideGo.AddComponent<WaterSlideGenerator>();
                 ApplyRandomSlideSettings(slide, enclosure, slideRng);
@@ -173,14 +196,17 @@ namespace WaterSlides
                 slide.OpenShape = openShape;
                 slide.SlideColor = PickSlideColorStable(enclosure, openShape, slideRng);
                 slide.GenerateCollider = GenerateColliders;
+                slide.PreserveVerticalMotion = loopKind == SlideLoopKind.Vertical;
                 slide.SetControlPointsLocal(worldPath);
 
                 _slides.Add(slide);
 
                 if (i < SlideCount - 1)
                 {
-                    Vector3 worldEnd = worldPath[^1];
-                    var exitTangent = WaterSlideMeshBuilder.GetPathEndTangent(worldPath);
+                    // Use the ACTUAL rendered end of the slide (the mesh can push it lower than the
+                    // raw control point), so the next entrance really sits below the previous exit.
+                    Vector3 worldEnd = slide.ProcessedWorldEnd;
+                    var exitTangent = slide.ProcessedWorldEndTangent;
 
                     var heading = Vector3.ProjectOnPlane(exitTangent, Vector3.up);
                     if (heading.sqrMagnitude < 1e-4f)
@@ -265,7 +291,9 @@ namespace WaterSlides
             SlideEnclosure enclosure,
             Vector3 worldStart,
             Vector3 worldEntry,
-            bool isChainedSlide)
+            bool isChainedSlide,
+            SlideLoopKind loopKind,
+            float loopRadius)
         {
             var settings = new WaterSlidePathSettings
             {
@@ -282,12 +310,32 @@ namespace WaterSlides
                     : StartLaunchLength.Sample(rng),
                 AllowEntryRamp = true,
                 AscendingStart = !isChainedSlide,
+                LoopKind = loopKind,
+                LoopRadius = loopRadius,
                 WorldStart = worldStart,
                 WorldStartForward = worldEntry,
                 UseWorldSpace = true
             };
 
             return WaterSlidePathGenerator.GenerateInWorldSpace(rng, settings, worldStart, worldEntry);
+        }
+
+        SlideLoopKind PickLoopKind(System.Random rng, int index)
+        {
+            if (!EnableLoops || index == 0)
+                return SlideLoopKind.None;
+            if (rng.NextDouble() >= LoopChancePerSlide)
+                return SlideLoopKind.None;
+
+            bool canVertical = AllowVerticalLoops;
+            bool canHorizontal = AllowHorizontalLoops;
+            if (canVertical && canHorizontal)
+                return rng.NextDouble() < 0.5 ? SlideLoopKind.Vertical : SlideLoopKind.Horizontal;
+            if (canVertical)
+                return SlideLoopKind.Vertical;
+            if (canHorizontal)
+                return SlideLoopKind.Horizontal;
+            return SlideLoopKind.None;
         }
 
         static string BuildSlideName(int index, SlideEnclosure enclosure, OpenFlumeShape shape)
@@ -350,8 +398,8 @@ namespace WaterSlides
                 if (current == null || next == null)
                     continue;
 
-                var exit = current.transform.TransformPoint(current.EndPosition);
-                var entry = next.transform.TransformPoint(next.StartPosition);
+                var exit = current.ProcessedWorldEnd;
+                var entry = next.ProcessedWorldStart;
 
                 Gizmos.color = new Color(1f, 0.85f, 0.1f, 0.9f);
                 Gizmos.DrawLine(exit, entry);

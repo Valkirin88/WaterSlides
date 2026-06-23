@@ -17,6 +17,13 @@ namespace WaterSlides
         Drop
     }
 
+    public enum SlideLoopKind
+    {
+        None,
+        Horizontal,
+        Vertical
+    }
+
     public struct WaterSlidePathSettings
     {
         public float TargetLength;
@@ -30,6 +37,8 @@ namespace WaterSlides
         public float InitialLaunchLength;
         public bool AllowEntryRamp;
         public bool AscendingStart;
+        public SlideLoopKind LoopKind;
+        public float LoopRadius;
         public Vector3 WorldStart;
         public Vector3 WorldStartForward;
         public bool UseWorldSpace;
@@ -85,6 +94,9 @@ namespace WaterSlides
             float dropBudget = settings.TotalDrop;
             float lengthBudget = settings.TargetLength;
 
+            int loopAt = settings.LoopKind != SlideLoopKind.None ? Mathf.Max(features.Count / 2, 1) : -1;
+            int loopStart = -1, loopEnd = -1;
+
             for (int i = 0; i < features.Count; i++)
             {
                 float featureDrop = dropBudget / (features.Count - i);
@@ -92,15 +104,146 @@ namespace WaterSlides
                 if (i > 0)
                     InsertBlendPoint(points, ref state);
                 AppendFeature(points, ref state, rng, features[i], settings, featureLength, featureDrop);
+
+                if (i == loopAt)
+                {
+                    InsertBlendPoint(points, ref state);
+                    loopStart = points.Count;
+                    if (settings.LoopKind == SlideLoopKind.Vertical)
+                        AppendVerticalLoop(points, ref state, settings.LoopRadius, PickSign(rng));
+                    else
+                        AppendHorizontalLoop(points, ref state, settings.LoopRadius, settings.LoopRadius * 0.5f, PickSign(rng));
+                    loopEnd = points.Count - 1;
+                }
             }
 
             AppendExitTangentSegment(points);
-            EnforceMonotonicDescent(points, rampEndIndex);
-            EnsureMinimumTotalDrop(points, settings.TotalDrop, rampEndIndex);
-            SmoothCorners(points, rampEndIndex, iterations: 3, factor: 0.32f);
-            EnforceMonotonicDescent(points, rampEndIndex);
-            EnsureStartAboveEnd(points, settings.TotalDrop, rampEndIndex);
+
+            bool verticalLoop = settings.LoopKind == SlideLoopKind.Vertical;
+            SmoothCorners(points, iterations: verticalLoop ? 1 : 3, factor: 0.3f, protStart: loopStart, protEnd: loopEnd);
+
+            if (verticalLoop)
+            {
+                // Only push the run AFTER the loop downward, so the slide finishes below its
+                // start and clear of the loop, without flattening the loop itself.
+                DescendTailAfter(points, loopEnd, settings.TotalDrop * 0.5f);
+            }
+            else
+            {
+                // Horizontal loops already descend, so normal "always down" rules are safe.
+                EnforceMonotonicDescent(points, rampEndIndex);
+                EnsureMinimumTotalDrop(points, settings.TotalDrop, rampEndIndex);
+                EnforceMonotonicDescent(points, rampEndIndex);
+                EnsureStartAboveEnd(points, settings.TotalDrop, rampEndIndex);
+            }
+
+            RemoveNearDuplicates(points, 0.15f);
             return points;
+        }
+
+        // Lowers points after a given index along a ramp so the path ends clearly below its start.
+        static void DescendTailAfter(List<Vector3> points, int afterIndex, float minDrop)
+        {
+            if (afterIndex < 0 || afterIndex >= points.Count - 1)
+                return;
+
+            float targetEndY = points[0].y - Mathf.Max(minDrop, 4f);
+            float deficit = points[^1].y - targetEndY;
+            if (deficit <= 0f)
+                return;
+
+            int from = afterIndex + 1;
+            int span = points.Count - 1 - from;
+            if (span <= 0)
+                return;
+
+            for (int k = from; k < points.Count; k++)
+            {
+                float t = (k - from) / (float)span;
+                points[k] = new Vector3(points[k].x, points[k].y - deficit * t, points[k].z);
+            }
+        }
+
+        // Drops consecutive points that are almost coincident; near-duplicate knots make the
+        // centripetal Catmull-Rom spline overshoot and the tube fold/break.
+        static void RemoveNearDuplicates(List<Vector3> points, float minSpacing)
+        {
+            if (points.Count < 3)
+                return;
+
+            float sqr = minSpacing * minSpacing;
+            for (int i = points.Count - 2; i >= 1; i--)
+            {
+                if ((points[i] - points[i - 1]).sqrMagnitude < sqr)
+                    points.RemoveAt(i);
+            }
+        }
+
+        // Vertical loop-the-loop: up -> over the top -> down. A flat (single-plane) loop crosses
+        // itself at mid-height (rising and falling strands meet), so we corkscrew it sideways: the
+        // path drifts laterally across the loop, bringing the down-strand back BESIDE the up-strand
+        // (separated by more than the tube width), plus a little forward so the exit keeps going.
+        static void AppendVerticalLoop(List<Vector3> points, ref PathState state, float radius, float sign)
+        {
+            radius = Mathf.Max(radius, 1.5f);
+            var h = Vector3.ProjectOnPlane(state.Forward, Vector3.up);
+            if (h.sqrMagnitude < 1e-4f)
+                h = Vector3.forward;
+            h.Normalize();
+
+            var lateralDir = Vector3.Cross(Vector3.up, h).normalized * sign;
+            var start = state.Position;
+            float lateral = radius * 1.2f;     // sideways separation between up/down strands
+            float forwardDrift = radius * 0.9f; // gentle forward progress for the exit
+
+            const int steps = 44;
+            for (int i = 1; i <= steps; i++)
+            {
+                float t = i / (float)steps;
+                float ang = t * Mathf.PI * 2f;
+                var pos = start
+                          + h * (radius * Mathf.Sin(ang) + forwardDrift * t)
+                          + Vector3.up * (radius * (1f - Mathf.Cos(ang)))
+                          + lateralDir * (lateral * t);
+                points.Add(pos);
+            }
+
+            state.Position = points[^1];
+            state.Forward = GetDescentForward((points[^1] - points[^2]).normalized);
+        }
+
+        // Horizontal loop: a single vertical-axis descending coil (like a spiral slide). The drop
+        // over the turn is larger than the loop diameter, so the entry and exit strands stay well
+        // apart vertically and the coil can never look joined or pass through itself.
+        static void AppendHorizontalLoop(List<Vector3> points, ref PathState state, float radius, float dropHint, float sign)
+        {
+            radius = Mathf.Max(radius, 1.5f);
+            var h = Vector3.ProjectOnPlane(state.Forward, Vector3.up);
+            if (h.sqrMagnitude < 1e-4f)
+                h = Vector3.forward;
+            h.Normalize();
+
+            var right = Vector3.Cross(Vector3.up, h).normalized * sign;
+            var center = state.Position + right * radius;
+            var startOffset = state.Position - center;
+            float startY = state.Position.y;
+
+            // Pitch (drop over the full turn) must clear the diameter so the coil is an open helix,
+            // not a flat stack of overlapping rings.
+            float totalDrop = Mathf.Max(radius * 2.2f, dropHint, 5f);
+
+            const int steps = 32;
+            for (int i = 1; i <= steps; i++)
+            {
+                float t = i / (float)steps;
+                var rot = Quaternion.AngleAxis(sign * 360f * t, Vector3.up) * startOffset;
+                var pos = center + rot;
+                pos.y = startY - totalDrop * t;
+                points.Add(pos);
+            }
+
+            state.Position = points[^1];
+            state.Forward = GetDescentForward((points[^1] - points[^2]).normalized);
         }
 
         // Gentle upward launch (~20 deg). Never near-vertical (avoids the "stick" artefact).
@@ -113,8 +256,8 @@ namespace WaterSlides
             return (horiz + Vector3.up * 0.36f).normalized;
         }
 
-        // Rounds every interior corner with a few Laplacian passes; endpoints stay fixed.
-        static void SmoothCorners(List<Vector3> points, int rampEndIndex, int iterations, float factor)
+        // Rounds every interior corner with a few Laplacian passes; endpoints and loop points stay fixed.
+        static void SmoothCorners(List<Vector3> points, int iterations, float factor, int protStart, int protEnd)
         {
             if (points.Count < 3)
                 return;
@@ -124,6 +267,8 @@ namespace WaterSlides
                 var copy = new List<Vector3>(points);
                 for (int i = 1; i < points.Count - 1; i++)
                 {
+                    if (protStart >= 0 && i >= protStart && i <= protEnd)
+                        continue;
                     var avg = (copy[i - 1] + copy[i + 1]) * 0.5f;
                     points[i] = Vector3.Lerp(copy[i], avg, factor);
                 }
