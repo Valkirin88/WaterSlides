@@ -17,7 +17,6 @@ namespace WaterSlides
         public void Setup()
         {
             EnsureLighting();
-            EnsureGround();
             EnsureCourse();
             EnsureCamera();
         }
@@ -33,24 +32,6 @@ namespace WaterSlides
             var light = lightGo.AddComponent<Light>();
             light.type = LightType.Directional;
             light.intensity = 1.2f;
-        }
-
-        void EnsureGround()
-        {
-            if (transform.Find("Ground") != null)
-                return;
-
-            var ground = GameObject.CreatePrimitive(PrimitiveType.Plane);
-            ground.name = "Ground";
-            ground.transform.SetParent(transform);
-            ground.transform.position = new Vector3(40f, -2f, 80f);
-            ground.transform.localScale = new Vector3(25f, 1f, 25f);
-
-            var shader = Shader.Find("Universal Render Pipeline/Lit") ?? Shader.Find("Standard");
-            ground.GetComponent<Renderer>().sharedMaterial = new Material(shader)
-            {
-                color = new Color(0.85f, 0.9f, 0.75f)
-            };
         }
 
         void EnsureCourse()
@@ -70,6 +51,7 @@ namespace WaterSlides
                 course.AllowLoopsAndSpirals = false;
                 course.RandomizeEachGeneration = true;
                 course.RandomSeed = 7;
+                _ = course.WaterPreset;
                 course.GenerateCourse();
             }
         }

@@ -23,7 +23,9 @@ namespace WaterSlides
 
         [Header("Closed Tube (32\" commercial scale)")]
         [Min(0.3f)] public float TubeRadius = 0.52f;
-        [Min(0.03f)] public float WallThickness = 0.08f;
+
+        [Tooltip("Толщина стенки закрытой трубы (метры).")]
+        [Range(0.03f, 1.5f)] public float WallThickness = 0.08f;
 
         [Header("Open Flume (42\" commercial scale)")]
         public OpenFlumeShape OpenShape = OpenFlumeShape.Square;
@@ -32,6 +34,9 @@ namespace WaterSlides
         [Min(0.1f)] public float FlumeLipHeight = 0.28f;
         [Min(0.05f)] public float FlumeCornerRadius = 0.14f;
         [Min(0f)] public float CopingOverhang = 0f;
+
+        [Tooltip("Толщина дна, бортов и бортика открытого жёлоба (метры).")]
+        [Range(0.03f, 1.5f)] public float FlumeWallThickness = 0.1f;
 
         [Header("Mesh Quality")]
         [Range(8, 40)] public int RingSegments = 24;
@@ -64,7 +69,7 @@ namespace WaterSlides
         {
             get
             {
-                var p = WaterSlideMeshBuilder.BuildProcessedPath(GetWorldControlPoints(), BuildSettings());
+                var p = WaterSlideMeshBuilder.BuildProcessedPath(GetWorldControlPoints(), BuildMeshSettings());
                 return p.Count > 0 ? p[0] : transform.TransformPoint(StartPosition);
             }
         }
@@ -73,7 +78,7 @@ namespace WaterSlides
         {
             get
             {
-                var p = WaterSlideMeshBuilder.BuildProcessedPath(GetWorldControlPoints(), BuildSettings());
+                var p = WaterSlideMeshBuilder.BuildProcessedPath(GetWorldControlPoints(), BuildMeshSettings());
                 return p.Count > 0 ? p[^1] : transform.TransformPoint(EndPosition);
             }
         }
@@ -82,7 +87,7 @@ namespace WaterSlides
         {
             get
             {
-                var p = WaterSlideMeshBuilder.BuildProcessedPath(GetWorldControlPoints(), BuildSettings());
+                var p = WaterSlideMeshBuilder.BuildProcessedPath(GetWorldControlPoints(), BuildMeshSettings());
                 if (p.Count < 2)
                     return transform.TransformDirection(EndTangent);
                 var dir = p[^1] - p[^2];
@@ -120,7 +125,7 @@ namespace WaterSlides
 
             EnsureComponents();
 
-            var settings = BuildSettings();
+            var settings = BuildMeshSettings();
             var worldPoints = GetWorldControlPoints();
             var visualMesh = WaterSlideMeshBuilder.BuildTube(worldPoints, settings);
             var rideMesh = WaterSlideMeshBuilder.BuildRideSurface(worldPoints, settings);
@@ -130,14 +135,10 @@ namespace WaterSlides
 
             _meshFilter.sharedMesh = visualMesh;
 
-            if (SlideMaterial != null)
-                _meshRenderer.sharedMaterial = SlideMaterial;
-            else
-            {
-                _runtimeMaterial ??= CreateDefaultMaterial();
-                ApplySlideColor(_runtimeMaterial);
-                _meshRenderer.sharedMaterial = _runtimeMaterial;
-            }
+            var mat = SlideMaterial != null ? SlideMaterial : (_runtimeMaterial ??= CreateDefaultMaterial());
+            WaterSlidesRendering.ConfigureSlideMaterial(mat);
+            WaterSlidesRendering.ApplySlideColor(mat, SlideColor);
+            _meshRenderer.sharedMaterial = mat;
 
             if (GenerateCollider && rideMesh != null)
             {
@@ -149,12 +150,23 @@ namespace WaterSlides
             {
                 _meshCollider.enabled = false;
             }
+
+            RebuildWater(settings, worldPoints);
         }
 
-        WaterSlideMeshBuilder.Settings BuildSettings() => new()
+        void RebuildWater(WaterSlideMeshBuilder.Settings settings, List<Vector3> worldPoints)
+        {
+            var water = GetComponent<WaterSlideWater>();
+            if (water == null)
+                return;
+
+            water.Rebuild(settings, worldPoints, this);
+        }
+
+        public WaterSlideMeshBuilder.Settings BuildMeshSettings() => new()
         {
             Enclosure = Enclosure,
-            WallThickness = WallThickness,
+            WallThickness = Enclosure == SlideEnclosure.Open ? FlumeWallThickness : WallThickness,
             RingSegments = RingSegments,
             SamplesPerSegment = SamplesPerSegment,
             BankStrength = BankStrength,
@@ -184,7 +196,7 @@ namespace WaterSlides
             Rebuild();
         }
 
-        List<Vector3> GetWorldControlPoints()
+        public List<Vector3> GetWorldControlPoints()
         {
             var world = new List<Vector3>(ControlPoints.Count);
             foreach (var p in ControlPoints)
@@ -208,46 +220,12 @@ namespace WaterSlides
 
         Material CreateDefaultMaterial()
         {
-            var shader = Shader.Find("Universal Render Pipeline/Lit");
-            if (shader == null)
-                shader = Shader.Find("Standard");
-
-            var mat = new Material(shader);
-            mat.SetFloat("_Smoothness", 0.92f);
-            mat.SetFloat("_Metallic", 0.02f);
+            var mat = new Material(WaterSlidesRendering.GetSlideShader());
+            WaterSlidesRendering.ConfigureSlideMaterial(mat);
             ApplySlideColor(mat);
             return mat;
         }
 
-        void ApplySlideColor(Material mat)
-        {
-            if (mat.HasProperty("_BaseColor"))
-                mat.SetColor("_BaseColor", SlideColor);
-            else
-                mat.color = SlideColor;
-        }
-
-        void OnDrawGizmosSelected()
-        {
-            if (ControlPoints == null || ControlPoints.Count < 2)
-                return;
-
-            Gizmos.color = Color.cyan;
-            for (int i = 0; i < ControlPoints.Count; i++)
-            {
-                var world = transform.TransformPoint(ControlPoints[i]);
-                Gizmos.DrawSphere(world, 0.4f);
-                if (i > 0)
-                {
-                    var prev = transform.TransformPoint(ControlPoints[i - 1]);
-                    Gizmos.DrawLine(prev, world);
-                }
-            }
-
-            var sampled = WaterSlideMeshBuilder.SamplePath(GetWorldControlPoints(), SamplesPerSegment);
-            Gizmos.color = new Color(0.2f, 0.9f, 1f, 0.8f);
-            for (int i = 1; i < sampled.Count; i++)
-                Gizmos.DrawLine(sampled[i - 1], sampled[i]);
-        }
+        void ApplySlideColor(Material mat) => WaterSlidesRendering.ApplySlideColor(mat, SlideColor);
     }
 }

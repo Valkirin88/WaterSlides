@@ -40,8 +40,7 @@ namespace WaterSlides.Editor
             {
                 EditorGUI.BeginChangeCheck();
                 var world = generator.transform.TransformPoint(points[i]);
-                var handleSize = HandleUtility.GetHandleSize(world) * 0.12f;
-                var newWorld = Handles.FreeMoveHandle(world, handleSize, Vector3.zero, Handles.SphereHandleCap);
+                var newWorld = Handles.PositionHandle(world, Quaternion.identity);
 
                 if (EditorGUI.EndChangeCheck())
                 {

@@ -59,6 +59,7 @@ namespace WaterSlides
             }
         }
 
+        // Visual mesh: inner + outer shell + wall thickness caps (double-sided).
         public static Mesh BuildTube(IReadOnlyList<Vector3> controlPoints, Settings settings)
         {
             var path = BuildProcessedPath(controlPoints, settings);
@@ -69,10 +70,11 @@ namespace WaterSlides
             int ringVerts = settings.RingSegments;
             int rings = path.Count;
             bool isOpen = settings.Enclosure == SlideEnclosure.Open;
+            int segmentCount = isOpen ? ringVerts - 1 : ringVerts;
 
-            var vertices = new List<Vector3>();
-            var normals = new List<Vector3>();
-            var uvs = new List<Vector2>();
+            var vertices = new List<Vector3>(rings * ringVerts * 2);
+            var normals = new List<Vector3>(rings * ringVerts * 2);
+            var uvs = new List<Vector2>(rings * ringVerts * 2);
             var triangles = new List<int>();
 
             for (int ring = 0; ring < rings; ring++)
@@ -88,41 +90,39 @@ namespace WaterSlides
                     if (!isOpen && seg == ringVerts - 1)
                         t = 1f;
 
-                    SampleCrossSection(settings, t, outer: false, out var p2, out var n2);
-                    SampleCrossSection(settings, t, outer: true, out var p2o, out _);
+                    SampleCrossSection(settings, t, outer: true, out var outerPt, out var outerN);
+                    SampleCrossSection(settings, t, outer: false, out var innerPt, out var innerN);
 
-                    var inner = ToWorld(frame, p2);
-                    var outer = ToWorld(frame, p2o);
-                    var normal = ToWorldNormal(frame, n2);
-
-                    vertices.Add(inner);
-                    normals.Add(normal);
+                    vertices.Add(ToWorld(frame, outerPt));
+                    normals.Add(ToWorldNormal(frame, outerN));
                     uvs.Add(new Vector2(t, v));
 
-                    vertices.Add(outer);
-                    normals.Add(normal);
+                    vertices.Add(ToWorld(frame, innerPt));
+                    normals.Add(ToWorldNormal(frame, innerN));
                     uvs.Add(new Vector2(t, v));
                 }
             }
 
             for (int ring = 0; ring < rings - 1; ring++)
             {
-                int segmentCount = isOpen ? ringVerts - 1 : ringVerts;
                 for (int seg = 0; seg < segmentCount; seg++)
                 {
                     int next = isOpen ? seg + 1 : (seg + 1) % ringVerts;
-                    int i0 = (ring * ringVerts + seg) * 2;
-                    int i1 = (ring * ringVerts + next) * 2;
-                    int i2 = ((ring + 1) * ringVerts + seg) * 2;
-                    int i3 = ((ring + 1) * ringVerts + next) * 2;
+                    int o0 = (ring * ringVerts + seg) * 2;
+                    int o1 = (ring * ringVerts + next) * 2;
+                    int o2 = ((ring + 1) * ringVerts + seg) * 2;
+                    int o3 = ((ring + 1) * ringVerts + next) * 2;
+                    AddDoubleSidedQuad(triangles, o0, o1, o3, o2);
 
-                    AddQuad(triangles, i0, i2, i3, i1);
-                    AddQuad(triangles, i0 + 1, i1 + 1, i3 + 1, i2 + 1);
+                    int i0 = o0 + 1;
+                    int i1 = o1 + 1;
+                    int i2 = o2 + 1;
+                    int i3 = o3 + 1;
+                    AddDoubleSidedQuad(triangles, i0, i2, i3, i1);
                 }
             }
 
-            if (!isOpen)
-                AddFlangeRings(settings, frames, vertices, normals, uvs, triangles, ringVerts, rings);
+            AddWallThicknessCaps(vertices, normals, uvs, triangles, rings, ringVerts, isOpen);
 
             var mesh = new Mesh { name = "WaterSlide" };
             mesh.SetVertices(vertices);
@@ -131,6 +131,120 @@ namespace WaterSlides
             mesh.SetTriangles(triangles, 0);
             mesh.RecalculateBounds();
             return mesh;
+        }
+
+        // A thin water ribbon sitting at a fill level inside the tube/flume, following the path.
+        // UV.x = width (0–1), UV.y = distance along the slide — matches Suimono flow along V.
+        public static Mesh BuildWaterSurface(IReadOnlyList<Vector3> controlPoints, Settings settings, float fillFraction)
+        {
+            var path = BuildProcessedPath(controlPoints, settings);
+            if (path.Count < 2)
+                return null;
+
+            var frames = BuildFrames(path, settings.BankStrength, settings.Enclosure);
+            int rings = path.Count;
+
+            var vertices = new List<Vector3>(rings * 2);
+            var normals = new List<Vector3>(rings * 2);
+            var uvs = new List<Vector2>(rings * 2);
+            var triangles = new List<int>();
+
+            ComputeWaterChord(settings, Mathf.Clamp01(fillFraction), out float waterY, out float halfChord);
+            if (halfChord <= 0.001f)
+                return null;
+
+            float vAccum = 0f;
+            for (int ring = 0; ring < rings; ring++)
+            {
+                var frame = frames[ring];
+                if (ring > 0)
+                    vAccum += Vector3.Distance(frame.Position, frames[ring - 1].Position);
+
+                vertices.Add(ToWorld(frame, new Vector2(-halfChord, waterY)));
+                normals.Add(frame.Up);
+                uvs.Add(new Vector2(0f, vAccum));
+
+                vertices.Add(ToWorld(frame, new Vector2(halfChord, waterY)));
+                normals.Add(frame.Up);
+                uvs.Add(new Vector2(1f, vAccum));
+            }
+
+            for (int ring = 0; ring < rings - 1; ring++)
+            {
+                int i0 = ring * 2;
+                int i1 = ring * 2 + 1;
+                int i2 = (ring + 1) * 2;
+                int i3 = (ring + 1) * 2 + 1;
+                AddQuad(triangles, i0, i2, i3, i1);
+            }
+
+            var mesh = new Mesh { name = "WaterSlideWater" };
+            mesh.SetVertices(vertices);
+            mesh.SetNormals(normals);
+            mesh.SetUVs(0, uvs);
+            mesh.SetTriangles(triangles, 0);
+            mesh.RecalculateBounds();
+            return mesh;
+        }
+
+        // Exit point of the water ribbon at the end of the slide (for waterfalls / spill effects).
+        public static bool TryGetWaterExitInfo(
+            IReadOnlyList<Vector3> controlPoints,
+            Settings settings,
+            float fillFraction,
+            out Vector3 surfaceCenter,
+            out Vector3 surfaceRight,
+            out float halfWidth,
+            out Vector3 flowDirection)
+        {
+            surfaceCenter = default;
+            surfaceRight = Vector3.right;
+            halfWidth = 0f;
+            flowDirection = Vector3.forward;
+
+            var path = BuildProcessedPath(controlPoints, settings);
+            if (path.Count < 2)
+                return false;
+
+            var frames = BuildFrames(path, settings.BankStrength, settings.Enclosure);
+            var frame = frames[^1];
+            ComputeWaterChord(settings, Mathf.Clamp01(fillFraction), out float waterY, out float halfChord);
+            if (halfChord <= 0.001f)
+                return false;
+
+            surfaceCenter = ToWorld(frame, new Vector2(0f, waterY));
+            surfaceRight = frame.Right;
+            halfWidth = halfChord;
+            var dir = path[^1] - path[^2];
+            flowDirection = dir.sqrMagnitude > 1e-6f ? dir.normalized : frame.Forward;
+            return true;
+        }
+
+        // Water surface height (local Y, along frame Up) and half-width of the surface at that height.
+        public static void ComputeWaterChord(Settings settings, float fill, out float waterY, out float halfChord)
+        {
+            if (settings.Enclosure == SlideEnclosure.Open)
+            {
+                float d = settings.OpenFlume.Depth;
+                float halfW = settings.OpenFlume.Width * 0.5f;
+                waterY = -d + fill * d;
+
+                if (settings.OpenFlume.Shape == OpenFlumeShape.Rounded)
+                {
+                    float k = Mathf.Clamp01(1f - (waterY / d) * (waterY / d));
+                    halfChord = halfW * Mathf.Sqrt(k) * 0.98f;
+                }
+                else
+                {
+                    halfChord = halfW * 0.92f;
+                }
+            }
+            else
+            {
+                float r = settings.ClosedTube.Radius;
+                waterY = -r + fill * 2f * r;
+                halfChord = Mathf.Sqrt(Mathf.Max(r * r - waterY * waterY, 0f)) * 0.98f;
+            }
         }
 
         public static Mesh BuildRideSurface(IReadOnlyList<Vector3> controlPoints, Settings settings)
@@ -443,114 +557,86 @@ namespace WaterSlides
             return Mathf.Clamp(turn * 0.55f, -32f, 32f);
         }
 
-        static void AddFlangeRings(
-            Settings settings,
-            List<Frame> frames,
+        static void AddWallThicknessCaps(
             List<Vector3> vertices,
             List<Vector3> normals,
             List<Vector2> uvs,
             List<int> triangles,
-            int ringVerts,
-            int rings)
-        {
-            AddFlangeRing(settings, frames[0], vertices, normals, uvs, triangles, ringVerts, rings, 0, -1f);
-            AddFlangeRing(settings, frames[^1], vertices, normals, uvs, triangles, ringVerts, rings, rings - 1, 1f);
-        }
-
-        static void AddFlangeRing(
-            Settings settings,
-            Frame frame,
-            List<Vector3> vertices,
-            List<Vector3> normals,
-            List<Vector2> uvs,
-            List<int> triangles,
-            int ringVerts,
             int rings,
-            int ringIndex,
-            float forwardSign)
+            int ringVerts,
+            bool isOpen)
         {
-            float flange = settings.WallThickness * 1.6f;
-            for (int seg = 0; seg < ringVerts; seg++)
+            int segmentCount = isOpen ? ringVerts - 1 : ringVerts;
+
+            // Own vertices + face normals so shell normals are not averaged (RecalculateNormals breaks shading).
+            for (int ring = 0; ring < rings; ring++)
             {
-                float t = seg / (float)ringVerts;
-                float tNext = (seg + 1) / (float)ringVerts;
-
-                SampleCrossSection(settings, t, true, out var p0, out var n0);
-                SampleCrossSection(settings, tNext, true, out var p1, out _);
-
-                var w0 = ToWorld(frame, p0);
-                var w1 = ToWorld(frame, p1);
-                var f0 = w0 + frame.Forward * flange * forwardSign;
-                var f1 = w1 + frame.Forward * flange * forwardSign;
-
-                var normal = ToWorldNormal(frame, n0);
-                var flangeNormal = frame.Forward * forwardSign;
-                int b = vertices.Count;
-                vertices.Add(w0); normals.Add(normal); uvs.Add(new Vector2(t, ringIndex / (float)(rings - 1)));
-                vertices.Add(f0); normals.Add(flangeNormal); uvs.Add(new Vector2(t, 0f));
-                vertices.Add(w1); normals.Add(normal); uvs.Add(new Vector2(tNext, ringIndex / (float)(rings - 1)));
-                vertices.Add(f1); normals.Add(flangeNormal); uvs.Add(new Vector2(tNext, 0f));
-                AddQuad(triangles, b, b + 2, b + 3, b + 1);
+                float v = ring / (float)(rings - 1);
+                for (int seg = 0; seg < segmentCount; seg++)
+                {
+                    int next = isOpen ? seg + 1 : (seg + 1) % ringVerts;
+                    int o0 = (ring * ringVerts + seg) * 2;
+                    int o1 = (ring * ringVerts + next) * 2;
+                    int i0 = o0 + 1;
+                    int i1 = o1 + 1;
+                    float u = seg / (float)Mathf.Max(segmentCount - 1, 1);
+                    AddCapQuad(vertices, normals, uvs, triangles,
+                        vertices[i0], vertices[o0], vertices[o1], vertices[i1],
+                        new Vector2(u, v));
+                }
             }
-        }
 
-        static void AddRimWalls(
-            List<Vector3> vertices,
-            List<Vector3> normals,
-            List<Vector2> uvs,
-            List<int> triangles,
-            int rings,
-            int ringVerts,
-            Settings settings)
-        {
-            AddRimWallStrip(vertices, normals, uvs, triangles, rings, ringVerts, 0, settings, leftEdge: true);
-            AddRimWallStrip(vertices, normals, uvs, triangles, rings, ringVerts, ringVerts - 1, settings, leftEdge: false);
-        }
-
-        static void AddRimWallStrip(
-            List<Vector3> vertices,
-            List<Vector3> normals,
-            List<Vector2> uvs,
-            List<int> triangles,
-            int rings,
-            int ringVerts,
-            int seg,
-            Settings settings,
-            bool leftEdge)
-        {
             for (int ring = 0; ring < rings - 1; ring++)
             {
-                int i0 = (ring * ringVerts + seg) * 2;
-                int i1 = ((ring + 1) * ringVerts + seg) * 2;
-                int o0 = i0 + 1;
-                int o1 = i1 + 1;
-
-                var innerA = vertices[i0];
-                var outerA = vertices[o0];
-                var innerB = vertices[i1];
-                var outerB = vertices[o1];
-
-                var n = Vector3.Cross(outerA - innerA, innerB - innerA).normalized;
-                if (n.sqrMagnitude < 0.0001f)
-                    continue;
-
-                int baseIdx = vertices.Count;
-                vertices.Add(innerA); normals.Add(n); uvs.Add(new Vector2(0f, ring / (float)(rings - 1)));
-                vertices.Add(outerA); normals.Add(n); uvs.Add(new Vector2(1f, ring / (float)(rings - 1)));
-                vertices.Add(innerB); normals.Add(n); uvs.Add(new Vector2(0f, (ring + 1) / (float)(rings - 1)));
-                vertices.Add(outerB); normals.Add(n); uvs.Add(new Vector2(1f, (ring + 1) / (float)(rings - 1)));
-
-                if (leftEdge)
-                    AddQuad(triangles, baseIdx, baseIdx + 2, baseIdx + 3, baseIdx + 1);
-                else
-                    AddQuad(triangles, baseIdx, baseIdx + 1, baseIdx + 3, baseIdx + 2);
+                float v = ring / (float)(rings - 1);
+                for (int seg = 0; seg < ringVerts; seg++)
+                {
+                    int o0 = (ring * ringVerts + seg) * 2;
+                    int o2 = ((ring + 1) * ringVerts + seg) * 2;
+                    int i0 = o0 + 1;
+                    int i2 = o2 + 1;
+                    float u = seg / (float)Mathf.Max(ringVerts - 1, 1);
+                    AddCapQuad(vertices, normals, uvs, triangles,
+                        vertices[i0], vertices[o0], vertices[o2], vertices[i2],
+                        new Vector2(u, v));
+                }
             }
+        }
+
+        static void AddCapQuad(
+            List<Vector3> vertices,
+            List<Vector3> normals,
+            List<Vector2> uvs,
+            List<int> triangles,
+            Vector3 a,
+            Vector3 b,
+            Vector3 c,
+            Vector3 d,
+            Vector2 uv)
+        {
+            var n = Vector3.Cross(b - a, c - a);
+            if (n.sqrMagnitude < 1e-10f)
+                return;
+            n.Normalize();
+
+            int baseIdx = vertices.Count;
+            vertices.Add(a); normals.Add(n); uvs.Add(uv);
+            vertices.Add(b); normals.Add(n); uvs.Add(uv);
+            vertices.Add(c); normals.Add(n); uvs.Add(uv);
+            vertices.Add(d); normals.Add(n); uvs.Add(uv);
+            AddDoubleSidedQuad(triangles, baseIdx, baseIdx + 1, baseIdx + 2, baseIdx + 3);
         }
 
         static void AddQuad(List<int> tris, int a, int b, int c, int d)
         {
             tris.Add(a); tris.Add(b); tris.Add(c);
             tris.Add(c); tris.Add(d); tris.Add(a);
+        }
+
+        static void AddDoubleSidedQuad(List<int> tris, int a, int b, int c, int d)
+        {
+            AddQuad(tris, a, b, c, d);
+            AddQuad(tris, a, d, c, b);
         }
     }
 }

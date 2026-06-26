@@ -1,5 +1,6 @@
 using System.Collections.Generic;
 using UnityEngine;
+using UnityEngine.Serialization;
 
 namespace WaterSlides
 {
@@ -83,24 +84,57 @@ namespace WaterSlides
         [Tooltip("Радиус петель (метры).")]
         public FloatRange LoopRadius = new() { Min = 3.5f, Max = 6f };
 
+        [Header("Thickness")]
+        [Tooltip("Общий множитель размеров сечения (радиус, ширина жёлоба). Не влияет на толщину стенок.")]
+        [Range(0.25f, 5f)] public float ThicknessScale = 1f;
+
         [Header("Closed Tube — Per Slide Ranges")]
+        [Tooltip("Внутренний радиус закрытой круглой трубы (метры). Множится на ThicknessScale.")]
         public FloatRange TubeRadius = new() { Min = 0.45f, Max = 0.6f };
-        public FloatRange WallThickness = new() { Min = 0.06f, Max = 0.1f };
+
+        [Tooltip("Толщина стенки закрытой трубы (метры).")]
+        [FormerlySerializedAs("WallThickness")]
+        public FloatRange ClosedWallThickness = new() { Min = 0.08f, Max = 0.2f };
 
         [Header("Open Flume — Per Slide Ranges")]
+        [Tooltip("Толщина дна, бортов и бортика открытого жёлоба (метры).")]
+        public FloatRange OpenFlumeWallThickness = new() { Min = 0.1f, Max = 0.25f };
+
+        [Tooltip("Ширина открытого жёлоба (метры). Множится на ThicknessScale.")]
         public FloatRange FlumeWidth = new() { Min = 0.95f, Max = 1.2f };
+
+        [Tooltip("Глубина (высота стенок) открытого жёлоба от дна до начала бортика (метры). Множится на ThicknessScale.")]
         public FloatRange FlumeDepth = new() { Min = 0.26f, Max = 0.38f };
+
+        [Tooltip("Высота загнутого наружу бортика по краям жёлоба (метры). Множится на ThicknessScale.")]
         public FloatRange FlumeLipHeight = new() { Min = 0.22f, Max = 0.34f };
+
+        [Tooltip("Радиус скругления углов сечения жёлоба (метры). Множится на ThicknessScale.")]
         public FloatRange FlumeCornerRadius = new() { Min = 0.1f, Max = 0.18f };
 
         [Header("Mesh Quality — Per Slide Ranges")]
+        [Tooltip("Число вершин по кольцу сечения. Больше — глаже округлость трубы, но тяжелее меш.")]
         public IntRange RingSegments = new() { Min = 20, Max = 28 };
+
+        [Tooltip("Число сэмплов вдоль каждого сегмента пути. Больше — глаже изгибы вдоль трубы.")]
         public IntRange SamplesPerSegment = new() { Min = 12, Max = 18 };
+
+        [Tooltip("Сила наклона (банкинга) трубы в поворотах. 0 — без наклона (для открытых жёлобов всегда 0).")]
         public FloatRange BankStrength = new() { Min = 0.7f, Max = 1.2f };
 
+        [Header("Water — Course")]
+        [Tooltip("Водопад из конца горки при переходе к следующей.")]
+        public bool WaterfallAtExits = true;
+
+        [Tooltip("Водопад с последней горки курса.")]
+        public bool WaterfallOnLastSlide = true;
+
         [Header("Slide Types")]
-        [Tooltip("Чередовать открытые и закрытые горки (первая всё равно открытая).")]
+        [Tooltip("Разрешить закрытые трубы среди открытых горок (первая всё равно открытая).")]
         public bool MixOpenAndClosed = true;
+
+        [Tooltip("Вероятность закрытой горки (0 = только открытые, 1 = только закрытые). Первая горка всегда открытая.")]
+        [Range(0f, 1f)] public float ClosedSlideChance = 0.25f;
 
         [Tooltip("Форма открытых горок: квадратный желоб, округлый или случайный выбор.")]
         public OpenShapeMode OpenFlumeShapeMode = OpenShapeMode.Mixed;
@@ -133,11 +167,22 @@ namespace WaterSlides
         };
 
         readonly List<WaterSlideGenerator> _slides = new();
+        WaterSlideWater _waterPreset;
 
         public IReadOnlyList<WaterSlideGenerator> Slides => _slides;
 
+        public WaterSlideWater WaterPreset => GetWaterPreset();
+
+        WaterSlideWater GetWaterPreset()
+        {
+            if (_waterPreset == null && !TryGetComponent(out _waterPreset))
+                _waterPreset = gameObject.AddComponent<WaterSlideWater>();
+            return _waterPreset;
+        }
+
         void OnEnable()
         {
+            GetWaterPreset();
             if (_slides.Count == 0)
                 GenerateCourse();
         }
@@ -156,6 +201,10 @@ namespace WaterSlides
         void Build(bool useRandomSeed)
         {
             ClearCourse();
+
+            var waterPreset = GetWaterPreset();
+            waterPreset.AutoAssignPrefabs();
+            WaterSlideWater.EnsureModuleInScene(transform, waterPreset.SuimonoModulePrefab);
 
             int seed = useRandomSeed
                 ? RandomSeed ^ System.Environment.TickCount
@@ -197,6 +246,10 @@ namespace WaterSlides
                 slide.SlideColor = PickSlideColorStable(enclosure, openShape, slideRng);
                 slide.GenerateCollider = GenerateColliders;
                 slide.PreserveVerticalMotion = loopKind == SlideLoopKind.Vertical;
+
+                var water = slideGo.AddComponent<WaterSlideWater>();
+                ApplyWaterSettings(water, i == SlideCount - 1);
+
                 slide.SetControlPointsLocal(worldPath);
 
                 _slides.Add(slide);
@@ -251,23 +304,74 @@ namespace WaterSlides
             return (horizontal + Vector3.up * rise).normalized;
         }
 
+        void ApplyWaterSettings(WaterSlideWater water, bool isLastSlide)
+        {
+            water.CopyFrom(GetWaterPreset());
+            if (!water.EnableWater || !WaterfallAtExits || (!WaterfallOnLastSlide && isLastSlide))
+                water.EnableWaterfall = false;
+        }
+
+        [ContextMenu("Rebuild All Slide Meshes")]
+        public void RebuildAllSlideMeshes()
+        {
+            foreach (var slide in GetComponentsInChildren<WaterSlideGenerator>())
+                slide.Rebuild();
+        }
+
+        [ContextMenu("Apply Thickness To All Slides")]
+        public void ApplyThicknessToAllSlides()
+        {
+            var slides = GetComponentsInChildren<WaterSlideGenerator>();
+            for (int i = 0; i < slides.Length; i++)
+            {
+                var slide = slides[i];
+                var rng = new System.Random(RandomSeed + i * 7919);
+                if (slide.Enclosure == SlideEnclosure.Closed)
+                    slide.WallThickness = ClosedWallThickness.Sample(rng);
+                else
+                    slide.FlumeWallThickness = OpenFlumeWallThickness.Sample(rng);
+                slide.Rebuild();
+            }
+        }
+
+        [ContextMenu("Apply Water Preset To All Slides")]
+        public void ApplyWaterPresetToAllSlides()
+        {
+            var preset = GetWaterPreset();
+            preset.AutoAssignPrefabs();
+
+            var slides = GetComponentsInChildren<WaterSlideGenerator>();
+            for (int i = 0; i < slides.Length; i++)
+            {
+                var water = slides[i].GetComponent<WaterSlideWater>();
+                if (water == null)
+                    continue;
+
+                ApplyWaterSettings(water, i == slides.Length - 1);
+                water.Rebuild();
+            }
+        }
+
         void ApplyRandomSlideSettings(WaterSlideGenerator slide, SlideEnclosure enclosure, System.Random rng)
         {
-            slide.WallThickness = WallThickness.Sample(rng);
+            float scale = Mathf.Max(ThicknessScale, 0.05f);
+
             slide.RingSegments = RingSegments.Sample(rng);
             slide.SamplesPerSegment = SamplesPerSegment.Sample(rng);
             slide.BankStrength = enclosure == SlideEnclosure.Open ? 0f : BankStrength.Sample(rng);
 
             if (enclosure == SlideEnclosure.Closed)
             {
-                slide.TubeRadius = TubeRadius.Sample(rng);
+                slide.WallThickness = ClosedWallThickness.Sample(rng);
+                slide.TubeRadius = TubeRadius.Sample(rng) * scale;
             }
             else
             {
-                slide.FlumeWidth = FlumeWidth.Sample(rng);
-                slide.FlumeDepth = FlumeDepth.Sample(rng);
-                slide.FlumeLipHeight = FlumeLipHeight.Sample(rng);
-                slide.FlumeCornerRadius = FlumeCornerRadius.Sample(rng);
+                slide.FlumeWallThickness = OpenFlumeWallThickness.Sample(rng);
+                slide.FlumeWidth = FlumeWidth.Sample(rng) * scale;
+                slide.FlumeDepth = FlumeDepth.Sample(rng) * scale;
+                slide.FlumeLipHeight = FlumeLipHeight.Sample(rng) * scale;
+                slide.FlumeCornerRadius = FlumeCornerRadius.Sample(rng) * scale;
             }
         }
 
@@ -380,32 +484,9 @@ namespace WaterSlides
             if (!MixOpenAndClosed)
                 return SlideEnclosure.Open;
 
-            if (AllowLoopsAndSpirals && rng.NextDouble() > 0.55)
-                return SlideEnclosure.Closed;
-
-            return index % 2 == 0 ? SlideEnclosure.Open : SlideEnclosure.Closed;
-        }
-
-        void OnDrawGizmos()
-        {
-            if (transform.childCount < 2)
-                return;
-
-            for (int i = 0; i < transform.childCount - 1; i++)
-            {
-                var current = transform.GetChild(i).GetComponent<WaterSlideGenerator>();
-                var next = transform.GetChild(i + 1).GetComponent<WaterSlideGenerator>();
-                if (current == null || next == null)
-                    continue;
-
-                var exit = current.ProcessedWorldEnd;
-                var entry = next.ProcessedWorldStart;
-
-                Gizmos.color = new Color(1f, 0.85f, 0.1f, 0.9f);
-                Gizmos.DrawLine(exit, entry);
-                Gizmos.DrawWireSphere(exit, 0.45f);
-                Gizmos.DrawWireSphere(entry, 0.35f);
-            }
+            return rng.NextDouble() < ClosedSlideChance
+                ? SlideEnclosure.Closed
+                : SlideEnclosure.Open;
         }
     }
 }

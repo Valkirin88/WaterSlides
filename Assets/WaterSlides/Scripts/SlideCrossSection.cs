@@ -117,8 +117,11 @@ namespace WaterSlides
         {
             float profileT = Mathf.Clamp01(t);
             var inner = SampleOpenInner(profileT, flume);
-            normal = GetOpenNormal(profileT, flume);
-            point = outer ? inner + normal * wallThickness : inner;
+            var offset = GetOpenExtrusionOffset(profileT, flume, inner, wallThickness);
+            normal = offset.sqrMagnitude > 1e-8f ? offset.normalized : Vector2.up;
+            point = outer ? inner + offset : inner;
+            if (!outer)
+                normal = -normal;
         }
 
         public static void SampleClosed(float t, in ClosedTube tube, float wallThickness, bool outer,
@@ -126,19 +129,58 @@ namespace WaterSlides
         {
             normal = SampleClosedInner(t, tube).normalized;
             var inner = normal * tube.Radius;
-            point = outer ? normal * (tube.Radius + wallThickness) : inner;
+            point = outer ? inner + normal * wallThickness : inner;
+            if (!outer)
+                normal = -normal;
         }
 
-        static Vector2 GetOpenNormal(float t, in OpenFlume flume)
+        static Vector2 GetOpenExtrusionOffset(float profileT, in OpenFlume flume, Vector2 inner, float thickness)
         {
-            const float d = 0.004f;
-            float aT = Mathf.Max(0f, t - d);
-            float bT = Mathf.Min(OpenProfileEnd, t + d);
-            var a = SampleOpenInner(aT, flume);
-            var b = SampleOpenInner(bT, flume);
-            var tangent = (b - a).normalized;
-            var n = new Vector2(tangent.y, -tangent.x);
-            return n.sqrMagnitude < 0.0001f ? Vector2.left : n;
+            return flume.Shape == OpenFlumeShape.Rounded
+                ? GetOpenRoundedExtrusion(profileT, flume, inner, thickness)
+                : GetOpenSquareExtrusion(profileT, flume, inner, thickness);
+        }
+
+        static Vector2 GetOpenSquareExtrusion(float profileT, in OpenFlume flume, Vector2 inner, float thickness)
+        {
+            float t = Mathf.Clamp01(profileT / OpenProfileEnd);
+            float halfW = flume.Width * 0.5f;
+            float d = flume.Depth;
+            float r = Mathf.Min(flume.CornerRadius, halfW * 0.4f, d * 0.8f);
+
+            if (t <= 0.11f)
+                return Vector2.left * thickness;
+            if (t <= 0.19f)
+                return RadialCornerOffset(inner, new Vector2(-halfW + r, -d + r), thickness);
+            if (t <= 0.5f)
+                return Vector2.down * thickness;
+            if (t <= 0.58f)
+                return RadialCornerOffset(inner, new Vector2(halfW - r, -d + r), thickness);
+            return Vector2.right * thickness;
+        }
+
+        static Vector2 GetOpenRoundedExtrusion(float profileT, in OpenFlume flume, Vector2 inner, float thickness)
+        {
+            float t = Mathf.Clamp01(profileT / OpenProfileEnd);
+            const float lipFrac = 0.12f;
+
+            if (t <= lipFrac)
+                return Vector2.left * thickness;
+            if (t >= 1f - lipFrac)
+                return Vector2.right * thickness;
+
+            var fromCenter = inner;
+            if (fromCenter.sqrMagnitude < 1e-8f)
+                return Vector2.down * thickness;
+            return fromCenter.normalized * thickness;
+        }
+
+        static Vector2 RadialCornerOffset(Vector2 inner, Vector2 center, float thickness)
+        {
+            var dir = inner - center;
+            if (dir.sqrMagnitude < 1e-8f)
+                return Vector2.down * thickness;
+            return dir.normalized * thickness;
         }
     }
 }

@@ -15,6 +15,21 @@ namespace WaterSlides.Editor
             bool changed = EditorGUI.EndChangeCheck();
 
             EditorGUILayout.Space();
+            EditorGUILayout.HelpBox(
+                "Вода — Water Slide Water на этом объекте (шаблон для всех горок).\n" +
+                "Настройте воду здесь, затем «Apply Water To All Slides» или Generate Course.",
+                MessageType.Info);
+
+            EditorGUILayout.Space();
+            if (GUILayout.Button("Rebuild All Slide Meshes"))
+                course.RebuildAllSlideMeshes();
+
+            if (GUILayout.Button("Apply Thickness To All Slides"))
+                course.ApplyThicknessToAllSlides();
+
+            if (GUILayout.Button("Apply Water To All Slides"))
+                course.ApplyWaterPresetToAllSlides();
+
             if (GUILayout.Button("Generate Course (Randomize)"))
                 course.GenerateCourse();
 
@@ -41,6 +56,7 @@ namespace WaterSlides.Editor
             var go = new GameObject("Water Slide");
             Undo.RegisterCreatedObjectUndo(go, "Create Water Slide");
             go.AddComponent<WaterSlideGenerator>();
+            go.AddComponent<WaterSlideWater>();
 
             if (Selection.activeTransform != null)
                 go.transform.SetParent(Selection.activeTransform);
@@ -54,6 +70,7 @@ namespace WaterSlides.Editor
             var go = new GameObject("Water Slide Course");
             Undo.RegisterCreatedObjectUndo(go, "Create Water Slide Course");
             var course = go.AddComponent<WaterSlideCourse>();
+            go.AddComponent<WaterSlideWater>();
             course.GenerateCourse();
 
             if (Selection.activeTransform != null)
