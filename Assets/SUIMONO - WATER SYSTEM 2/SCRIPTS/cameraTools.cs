@@ -106,8 +106,12 @@ namespace Suimono.Core
 				if (transform.parent != null) surfaceRenderer = transform.parent.gameObject.GetComponent<Renderer>();
 			} else {
 				if (transform.parent != null){
-					surfaceRenderer = transform.parent.Find("Suimono_Object").gameObject.GetComponent<Renderer>();
-					scaleRenderer = transform.parent.Find("Suimono_ObjectScale").gameObject.GetComponent<Renderer>();
+					var suimonoObject = transform.parent.Find("Suimono_Object");
+					if (suimonoObject != null)
+						surfaceRenderer = suimonoObject.GetComponent<Renderer>();
+					var suimonoScale = transform.parent.Find("Suimono_ObjectScale");
+					if (suimonoScale != null)
+						scaleRenderer = suimonoScale.GetComponent<Renderer>();
 				}
 			}
 
@@ -389,10 +393,12 @@ namespace Suimono.Core
 						Shader.SetGlobalTexture("_suimono_underwaterTex",renderTexDiff);
 					}
 					if (cameraType == suiCamToolType.localReflection){
-						if (surfaceRenderer != null) surfaceRenderer.sharedMaterial.SetTexture("_ReflectionTex",renderTexDiff);
+						if (surfaceRenderer != null && surfaceRenderer.sharedMaterial != null)
+							surfaceRenderer.sharedMaterial.SetTexture("_ReflectionTex",renderTexDiff);
 					}
 					if (cameraType == suiCamToolType.shorelineObject){
-						if (surfaceRenderer != null) surfaceRenderer.sharedMaterial.SetTexture("_MainTex",renderTexDiff);
+						if (surfaceRenderer != null && surfaceRenderer.sharedMaterial != null)
+							surfaceRenderer.sharedMaterial.SetTexture("_MainTex",renderTexDiff);
 					}
 					if (cameraType == suiCamToolType.shorelineCapture){
 						Shader.SetGlobalTexture("_suimono_shorelineTex",renderTexDiff);

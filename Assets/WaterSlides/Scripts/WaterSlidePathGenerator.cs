@@ -44,6 +44,15 @@ namespace WaterSlides
         public bool UseWorldSpace;
     }
 
+    public struct GeneratedSlidePath
+    {
+        public List<Vector3> Points;
+        public int LoopPathStart;
+        public int LoopPathEnd;
+
+        public bool HasLoop => LoopPathStart >= 0 && LoopPathEnd > LoopPathStart;
+    }
+
     public static class WaterSlidePathGenerator
     {
         struct PathState
@@ -52,7 +61,10 @@ namespace WaterSlides
             public Vector3 Forward;
         }
 
-        public static List<Vector3> Generate(System.Random rng, WaterSlidePathSettings settings)
+        public static List<Vector3> Generate(System.Random rng, WaterSlidePathSettings settings) =>
+            GeneratePath(rng, settings).Points;
+
+        public static GeneratedSlidePath GeneratePath(System.Random rng, WaterSlidePathSettings settings)
         {
             if (settings.UseWorldSpace)
                 return GenerateInWorldSpace(rng, settings, settings.WorldStart, settings.WorldStartForward);
@@ -60,7 +72,7 @@ namespace WaterSlides
             return GenerateInWorldSpace(rng, settings, Vector3.zero, Vector3.forward);
         }
 
-        public static List<Vector3> GenerateInWorldSpace(
+        public static GeneratedSlidePath GenerateInWorldSpace(
             System.Random rng,
             WaterSlidePathSettings settings,
             Vector3 worldStart,
@@ -110,7 +122,10 @@ namespace WaterSlides
                     InsertBlendPoint(points, ref state);
                     loopStart = points.Count;
                     if (settings.LoopKind == SlideLoopKind.Vertical)
-                        AppendVerticalLoop(points, ref state, settings.LoopRadius, PickSign(rng));
+                    {
+                        AppendVerticalLoop(points, ref state, settings.LoopRadius, PickSign(rng), out var lateralDir);
+                        AppendVerticalLoopExitRamp(points, ref state, settings.LoopRadius, lateralDir);
+                    }
                     else
                         AppendHorizontalLoop(points, ref state, settings.LoopRadius, settings.LoopRadius * 0.5f, PickSign(rng));
                     loopEnd = points.Count - 1;
@@ -137,8 +152,13 @@ namespace WaterSlides
                 EnsureStartAboveEnd(points, settings.TotalDrop, rampEndIndex);
             }
 
-            RemoveNearDuplicates(points, 0.15f);
-            return points;
+            RemoveNearDuplicates(points, 0.15f, ref loopStart, ref loopEnd);
+            return new GeneratedSlidePath
+            {
+                Points = points,
+                LoopPathStart = loopStart,
+                LoopPathEnd = loopEnd
+            };
         }
 
         // Lowers points after a given index along a ramp so the path ends clearly below its start.
@@ -166,7 +186,7 @@ namespace WaterSlides
 
         // Drops consecutive points that are almost coincident; near-duplicate knots make the
         // centripetal Catmull-Rom spline overshoot and the tube fold/break.
-        static void RemoveNearDuplicates(List<Vector3> points, float minSpacing)
+        static void RemoveNearDuplicates(List<Vector3> points, float minSpacing, ref int protStart, ref int protEnd)
         {
             if (points.Count < 3)
                 return;
@@ -174,8 +194,22 @@ namespace WaterSlides
             float sqr = minSpacing * minSpacing;
             for (int i = points.Count - 2; i >= 1; i--)
             {
+                if (protStart >= 0 && i >= protStart && i <= protEnd)
+                    continue;
+
                 if ((points[i] - points[i - 1]).sqrMagnitude < sqr)
+                {
                     points.RemoveAt(i);
+                    if (protStart >= 0 && i < protStart)
+                    {
+                        protStart--;
+                        protEnd--;
+                    }
+                    else if (protStart >= 0 && i <= protEnd)
+                    {
+                        protEnd--;
+                    }
+                }
             }
         }
 
@@ -183,7 +217,7 @@ namespace WaterSlides
         // itself at mid-height (rising and falling strands meet), so we corkscrew it sideways: the
         // path drifts laterally across the loop, bringing the down-strand back BESIDE the up-strand
         // (separated by more than the tube width), plus a little forward so the exit keeps going.
-        static void AppendVerticalLoop(List<Vector3> points, ref PathState state, float radius, float sign)
+        static void AppendVerticalLoop(List<Vector3> points, ref PathState state, float radius, float sign, out Vector3 lateralDir)
         {
             radius = Mathf.Max(radius, 1.5f);
             var h = Vector3.ProjectOnPlane(state.Forward, Vector3.up);
@@ -191,10 +225,10 @@ namespace WaterSlides
                 h = Vector3.forward;
             h.Normalize();
 
-            var lateralDir = Vector3.Cross(Vector3.up, h).normalized * sign;
+            lateralDir = Vector3.Cross(Vector3.up, h).normalized * sign;
             var start = state.Position;
-            float lateral = radius * 1.2f;     // sideways separation between up/down strands
-            float forwardDrift = radius * 0.9f; // gentle forward progress for the exit
+            float lateral = radius * 1.55f;
+            float forwardDrift = radius * 0.9f;
 
             const int steps = 44;
             for (int i = 1; i <= steps; i++)
@@ -205,6 +239,29 @@ namespace WaterSlides
                           + h * (radius * Mathf.Sin(ang) + forwardDrift * t)
                           + Vector3.up * (radius * (1f - Mathf.Cos(ang)))
                           + lateralDir * (lateral * t);
+                points.Add(pos);
+            }
+
+            state.Position = points[^1];
+            state.Forward = GetDescentForward((points[^1] - points[^2]).normalized);
+        }
+
+        // Curves away from the loop volume so the next segment does not cut through the ring.
+        static void AppendVerticalLoopExitRamp(List<Vector3> points, ref PathState state, float radius, Vector3 lateralDir)
+        {
+            var horiz = Vector3.ProjectOnPlane(state.Forward, Vector3.up);
+            if (horiz.sqrMagnitude < 1e-4f)
+                horiz = Vector3.forward;
+            horiz.Normalize();
+
+            var start = state.Position;
+            for (int i = 1; i <= 5; i++)
+            {
+                float t = i / 5f;
+                var pos = start
+                          + horiz * (radius * 0.55f * t)
+                          + Vector3.down * (radius * 0.65f * t)
+                          + lateralDir * (radius * 0.2f * (1f - t));
                 points.Add(pos);
             }
 

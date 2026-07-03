@@ -1699,13 +1699,19 @@ namespace Suimono.Core
 			//check for visibility
        		for (int sX = 0; sX < sObjects.Count; sX++)
 		    {
-                if (sRends[sX] == null || !sRends[sX].isVisible) continue;
+                if (sRends[sX] == null) continue;
 
-                if (sObjects[sX].typeIndex == 0)
+                // Custom mesh ribbons (typeIndex > 0) are thin; frustum culling often
+                // reports isVisible=false up close even while the player should see them.
+                if (sObjects[sX].typeIndex > 0)
                 {
-		            if (sRendSCs[sX] != null && sRendSCs[sX].isVisible) { renderCount++; }
-		        }
-                else { renderCount++; }
+                    renderCount++;
+                    continue;
+                }
+
+                if (!sRends[sX].isVisible) continue;
+
+                if (sRendSCs[sX] != null && sRendSCs[sX].isVisible) { renderCount++; }
 		    }
 
        		//Enable Functions

@@ -58,6 +58,10 @@ namespace WaterSlides
 
         void EnsureCamera()
         {
+            // In play mode the player owns Camera.main — do not snap it to the editor demo pose.
+            if (Application.isPlaying && FindAnyObjectByType<PlayerView>() != null)
+                return;
+
             var cam = Camera.main;
             if (cam == null)
             {
@@ -66,10 +70,9 @@ namespace WaterSlides
                 cam = camGo.AddComponent<Camera>();
                 camGo.AddComponent<AudioListener>();
                 camGo.transform.SetParent(transform);
+                cam.transform.position = new Vector3(-15f, 35f, -10f);
+                cam.transform.rotation = Quaternion.Euler(35f, 35f, 0f);
             }
-
-            cam.transform.position = new Vector3(-15f, 35f, -10f);
-            cam.transform.rotation = Quaternion.Euler(35f, 35f, 0f);
         }
     }
 }

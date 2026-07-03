@@ -1,4 +1,7 @@
+using System;
+using System.Collections;
 using System.Collections.Generic;
+using System.Text.RegularExpressions;
 using UnityEngine;
 using UnityEngine.Serialization;
 
@@ -171,6 +174,50 @@ namespace WaterSlides
 
         public IReadOnlyList<WaterSlideGenerator> Slides => _slides;
 
+        public bool IsReadyForPlayerSpawn(float heightOffset, float bodyClearance)
+        {
+            var slide = GetFirstSlide();
+            return slide != null
+                   && slide.IsRideColliderReady
+                   && slide.TryGetRideSpawnPose(heightOffset, bodyClearance, out _, out _);
+        }
+
+        public bool TryGetFirstSlideSpawn(
+            out Vector3 position,
+            out Vector3 forward,
+            float heightOffset = 2.5f,
+            float bodyClearance = 0.35f)
+        {
+            position = default;
+            forward = transform.forward;
+
+            var slide = GetFirstSlide();
+            if (slide == null)
+                return false;
+
+            return slide.TryGetRideSpawnPose(heightOffset, bodyClearance, out position, out forward);
+        }
+
+        WaterSlideGenerator GetFirstSlide()
+        {
+            EnsureSlidesRegistered();
+            return _slides.Count > 0 ? _slides[0] : null;
+        }
+
+        void EnsureSlidesRegistered()
+        {
+            if (_slides.Count > 0)
+                return;
+
+            if (!Application.isPlaying)
+                return;
+
+            if (TryAdoptSceneSlides())
+                return;
+
+            GenerateCourse();
+        }
+
         public WaterSlideWater WaterPreset => GetWaterPreset();
 
         WaterSlideWater GetWaterPreset()
@@ -180,11 +227,82 @@ namespace WaterSlides
             return _waterPreset;
         }
 
+        void Awake()
+        {
+            if (Application.isPlaying && _slides.Count == 0)
+                TryAdoptSceneSlides();
+        }
+
         void OnEnable()
         {
-            GetWaterPreset();
+            var preset = GetWaterPreset();
+            preset.AutoAssignPrefabs();
+
             if (_slides.Count == 0)
+            {
+                // In Play mode keep slides already built in the scene — regenerating destroys Suimono
+                // surfaces and they often fail to re‑register before the first rendered frame.
+                if (Application.isPlaying && TryAdoptSceneSlides())
+                {
+                    BeginPlayModeWater();
+                    return;
+                }
+
                 GenerateCourse();
+                return;
+            }
+
+            if (Application.isPlaying)
+                BeginPlayModeWater();
+        }
+
+        void BeginPlayModeWater()
+        {
+            WaterSlideWater.EnsureModuleInScene(transform, GetWaterPreset().SuimonoModulePrefab);
+            StartCoroutine(RefreshSlideWaterWhenReady());
+        }
+
+        static IEnumerator RefreshSlideWaterWhenReady()
+        {
+            for (int i = 0; i < 120; i++)
+            {
+                WaterSlideWater.RefreshAllInScene();
+                if (Camera.main != null)
+                    yield break;
+
+                yield return null;
+            }
+
+            WaterSlideWater.RefreshAllInScene();
+        }
+
+        bool TryAdoptSceneSlides()
+        {
+            var existing = GetComponentsInChildren<WaterSlideGenerator>(false);
+            if (existing.Length == 0)
+                return false;
+
+            Array.Sort(existing, CompareSlides);
+            _slides.AddRange(existing);
+            WaterSlideWater.EnsureModuleInScene(transform, GetWaterPreset().SuimonoModulePrefab);
+            return true;
+        }
+
+        static int CompareSlides(WaterSlideGenerator a, WaterSlideGenerator b)
+        {
+            int indexA = ParseSlideIndex(a != null ? a.name : null);
+            int indexB = ParseSlideIndex(b != null ? b.name : null);
+            int byIndex = indexA.CompareTo(indexB);
+            return byIndex != 0 ? byIndex : string.Compare(a.name, b.name, StringComparison.Ordinal);
+        }
+
+        static int ParseSlideIndex(string slideName)
+        {
+            if (string.IsNullOrEmpty(slideName))
+                return int.MaxValue;
+
+            var match = Regex.Match(slideName, @"Slide_(\d+)");
+            return match.Success && int.TryParse(match.Groups[1].Value, out int index) ? index : int.MaxValue;
         }
 
         [ContextMenu("Generate Course")]
@@ -237,7 +355,7 @@ namespace WaterSlides
                 slideGo.transform.SetPositionAndRotation(Vector3.zero, Quaternion.identity);
 
                 float loopRadius = LoopRadius.Sample(slideRng);
-                var worldPath = BuildSlidePathWorld(slideRng, enclosure, cursorPos, worldEntry, i > 0, loopKind, loopRadius);
+                var generatedPath = BuildSlidePathWorld(slideRng, enclosure, cursorPos, worldEntry, i > 0, loopKind, loopRadius);
 
                 var slide = slideGo.AddComponent<WaterSlideGenerator>();
                 ApplyRandomSlideSettings(slide, enclosure, slideRng);
@@ -246,11 +364,16 @@ namespace WaterSlides
                 slide.SlideColor = PickSlideColorStable(enclosure, openShape, slideRng);
                 slide.GenerateCollider = GenerateColliders;
                 slide.PreserveVerticalMotion = loopKind == SlideLoopKind.Vertical;
+                slide.HasLoop = generatedPath.HasLoop;
+                slide.LoopPathStart = generatedPath.LoopPathStart;
+                slide.LoopPathEnd = generatedPath.LoopPathEnd;
+                if (generatedPath.HasLoop)
+                    slide.BankStrength = 0f;
 
                 var water = slideGo.AddComponent<WaterSlideWater>();
                 ApplyWaterSettings(water, i == SlideCount - 1);
 
-                slide.SetControlPointsLocal(worldPath);
+                slide.SetControlPointsLocal(generatedPath.Points);
 
                 _slides.Add(slide);
 
@@ -390,7 +513,7 @@ namespace WaterSlides
             _slides.Clear();
         }
 
-        List<Vector3> BuildSlidePathWorld(
+        GeneratedSlidePath BuildSlidePathWorld(
             System.Random rng,
             SlideEnclosure enclosure,
             Vector3 worldStart,

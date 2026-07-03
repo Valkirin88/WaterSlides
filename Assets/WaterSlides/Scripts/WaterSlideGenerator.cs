@@ -53,10 +53,33 @@ namespace WaterSlides
         [Tooltip("Keep up/over vertical motion (vertical loops). Disables the 'always descend' clamp on the mesh path.")]
         public bool PreserveVerticalMotion;
 
+        [Tooltip("Set when this slide contains a loop segment (disables the 'always descend' clamp on the mesh path).")]
+        public bool HasLoop;
+
+        [HideInInspector] public int LoopPathStart = -1;
+        [HideInInspector] public int LoopPathEnd = -1;
+
         MeshFilter _meshFilter;
         MeshRenderer _meshRenderer;
         MeshCollider _meshCollider;
         Material _runtimeMaterial;
+        List<WaterSlideMeshBuilder.RideFrame> _rideFrames;
+
+        // Cached centreline frames of the rendered slide, in world space. Rebuilt lazily
+        // after every mesh rebuild; used by the player to ride the slide smoothly.
+        public IReadOnlyList<WaterSlideMeshBuilder.RideFrame> RideFrames
+        {
+            get
+            {
+                if (_rideFrames == null || _rideFrames.Count == 0)
+                    _rideFrames = WaterSlideMeshBuilder.BuildRideFrames(GetWorldControlPoints(), BuildMeshSettings());
+                return _rideFrames;
+            }
+        }
+
+        // Half of the usable cross-section width: how far the rider may drift sideways
+        // from the centreline before being pushed back.
+        public float RideHalfWidth => Enclosure == SlideEnclosure.Open ? FlumeWidth * 0.5f : TubeRadius;
 
         public Vector3 StartPosition => ControlPoints.Count > 0 ? ControlPoints[0] : transform.position;
         public Vector3 EndPosition => ControlPoints.Count > 0 ? ControlPoints[^1] : transform.position;
@@ -95,6 +118,82 @@ namespace WaterSlides
             }
         }
 
+        public Vector3 ProcessedWorldStartTangent
+        {
+            get
+            {
+                var p = WaterSlideMeshBuilder.BuildProcessedPath(GetWorldControlPoints(), BuildMeshSettings());
+                if (p.Count < 2)
+                    return transform.forward;
+                var dir = p[1] - p[0];
+                return dir.sqrMagnitude > 1e-6f ? dir.normalized : Vector3.forward;
+            }
+        }
+
+        public bool IsRideColliderReady =>
+            _meshCollider != null
+            && _meshCollider.enabled
+            && _meshCollider.sharedMesh != null
+            && _meshCollider.sharedMesh.vertexCount > 0;
+
+        public bool TryGetRideSpawnPose(
+            float heightAboveSurface,
+            float bodyClearance,
+            out Vector3 position,
+            out Vector3 forward)
+        {
+            position = default;
+            forward = Vector3.forward;
+
+            var settings = BuildMeshSettings();
+            var worldPoints = GetWorldControlPoints();
+            if (!WaterSlideMeshBuilder.TryGetRideStartPose(
+                    worldPoints, settings, heightAboveSurface, bodyClearance, out position, out forward))
+                return false;
+
+            if (TryRefineSpawnWithRaycast(ref position, forward, heightAboveSurface, bodyClearance))
+                return true;
+
+            return true;
+        }
+
+        bool TryRefineSpawnWithRaycast(
+            ref Vector3 position,
+            Vector3 forward,
+            float heightAboveSurface,
+            float bodyClearance)
+        {
+            if (_meshCollider == null || !_meshCollider.enabled || _meshCollider.sharedMesh == null)
+                return false;
+
+            float clearance = Mathf.Max(heightAboveSurface, 0.5f) + Mathf.Max(bodyClearance, 0f);
+            Vector3 probeOrigin = position + Vector3.up * 12f;
+            var hits = Physics.RaycastAll(probeOrigin, Vector3.down, 30f, ~0, QueryTriggerInteraction.Ignore);
+
+            float bestDist = float.MaxValue;
+            bool found = false;
+            Vector3 bestPoint = position;
+
+            foreach (var hit in hits)
+            {
+                if (hit.collider != _meshCollider)
+                    continue;
+
+                if (hit.distance >= bestDist)
+                    continue;
+
+                bestDist = hit.distance;
+                bestPoint = hit.point + hit.normal * clearance + forward.normalized * 0.15f;
+                found = true;
+            }
+
+            if (!found)
+                return false;
+
+            position = bestPoint;
+            return true;
+        }
+
         void OnEnable()
         {
             EnsureComponents();
@@ -115,7 +214,19 @@ namespace WaterSlides
             }
 
             EnsureComponents();
+
+#if UNITY_EDITOR
+            // Rebuild() cascades into water prefab instantiation; deferred out of
+            // OnValidate to avoid "SendMessage cannot be called during OnValidate" spam.
+            // OnValidate also fires while ENTERING play mode — defer unconditionally.
+            UnityEditor.EditorApplication.delayCall += () =>
+            {
+                if (this != null)
+                    Rebuild();
+            };
+#else
             Rebuild();
+#endif
         }
 
         public void Rebuild()
@@ -124,6 +235,7 @@ namespace WaterSlides
                 return;
 
             EnsureComponents();
+            _rideFrames = null;
 
             var settings = BuildMeshSettings();
             var worldPoints = GetWorldControlPoints();
@@ -144,7 +256,9 @@ namespace WaterSlides
             {
                 _meshCollider.sharedMesh = rideMesh;
                 _meshCollider.convex = false;
+                _meshCollider.material = WaterSlidePhysicsMaterials.Slide;
                 _meshCollider.enabled = true;
+                Physics.SyncTransforms();
             }
             else
             {
@@ -171,6 +285,7 @@ namespace WaterSlides
             SamplesPerSegment = SamplesPerSegment,
             BankStrength = BankStrength,
             PreserveVerticalMotion = PreserveVerticalMotion,
+            HasLoop = HasLoop,
             ClosedTube = new SlideCrossSection.ClosedTube { Radius = TubeRadius },
             OpenFlume = new SlideCrossSection.OpenFlume
             {

@@ -13,50 +13,162 @@ namespace WaterSlides
             public int SamplesPerSegment;
             public float BankStrength;
             public bool PreserveVerticalMotion;
+            public bool HasLoop;
 
             public SlideCrossSection.OpenFlume OpenFlume;
             public SlideCrossSection.ClosedTube ClosedTube;
         }
 
+        // A sample of the rendered centreline with its orientation. Used at runtime to guide
+        // the rider along the slide (stable tangent/up, lateral bounds) without depending on
+        // noisy per-triangle contact normals.
+        public struct RideFrame
+        {
+            public Vector3 Position;
+            public Vector3 Forward;
+            public Vector3 Up;
+        }
+
+        public static List<RideFrame> BuildRideFrames(IReadOnlyList<Vector3> controlPoints, Settings settings)
+        {
+            var result = new List<RideFrame>();
+            var path = BuildProcessedPath(controlPoints, settings);
+            if (path.Count < 2)
+                return result;
+
+            var frames = BuildFrames(path, settings);
+            result.Capacity = frames.Count;
+            foreach (var f in frames)
+                result.Add(new RideFrame { Position = f.Position, Forward = f.Forward, Up = f.Up });
+            return result;
+        }
+
         // The exact centreline the mesh is built on (after smoothing + descent clamping).
         // Use this for connecting slides so the jump lines up with what is actually rendered.
+        // Every path (including loops) goes through the same smoothing + densify pipeline so
+        // the tube is always built from one continuous, evenly spaced polyline — no raw
+        // sparse corners, no chord jumps, no separate mesh pieces.
         public static List<Vector3> BuildProcessedPath(IReadOnlyList<Vector3> controlPoints, Settings settings)
         {
-            var path = SamplePath(controlPoints, settings.SamplesPerSegment);
+            if (controlPoints == null || controlPoints.Count < 2)
+                return new List<Vector3>();
+
+            var path = BuildPathFromControls(controlPoints, settings.SamplesPerSegment);
+
             if (path.Count < 2)
                 return path;
 
-            path = StabilizePath(path, clampY: !settings.PreserveVerticalMotion);
-            if (!settings.PreserveVerticalMotion)
+            // Loops go up/over (vertical) or already descend by construction (horizontal
+            // helix), so the "always descend" clamps must not touch them.
+            bool clampY = !settings.PreserveVerticalMotion && !settings.HasLoop;
+            path = SmoothPathCorners(path, iterations: 3, factor: 0.3f, clampY);
+            float ringSpacing = Mathf.Clamp(0.55f - settings.SamplesPerSegment * 0.02f, 0.28f, 0.55f);
+            path = DensifyPathLinear(path, ringSpacing);
+            RemoveTinySteps(path, 0.02f);
+            path = StabilizePath(path, clampY);
+            if (clampY)
                 EnforcePathMonotonicDescent(path);
 
-            float clearance = settings.Enclosure == SlideEnclosure.Open
-                ? Mathf.Max(settings.OpenFlume.Width, 0.9f)
-                : Mathf.Max(settings.ClosedTube.Radius * 2f + settings.WallThickness * 2f, 0.9f);
-            RemoveSampledLoops(path, clearance);
             return path;
         }
 
-        // Removes tiny self-intersecting loops the spline can form at hard turns: if a later sample
-        // comes back within one tube-width of an earlier one, the points between them form a loop
-        // that is cut out. Real loops stay clear in 3D (helix pitch / corkscrew offset) so survive.
-        static void RemoveSampledLoops(List<Vector3> path, float clearance)
+        // Always polyline: Catmull-Rom overshoots through loops and creates start↔end chord faces.
+        static List<Vector3> BuildPathFromControls(IReadOnlyList<Vector3> controlPoints, int samplesPerSegment)
         {
-            if (path.Count < 5)
-                return;
+            if (controlPoints == null || controlPoints.Count < 2)
+                return new List<Vector3>();
 
-            float sqr = clearance * clearance;
-            for (int i = 0; i < path.Count - 4; i++)
+            if (controlPoints.Count >= 24)
+                return new List<Vector3>(controlPoints);
+
+            return SamplePathLinear(controlPoints, samplesPerSegment);
+        }
+
+        static List<Vector3> DensifyPathLinear(List<Vector3> path, float maxStep)
+        {
+            if (path.Count < 2)
+                return path;
+
+            maxStep = Mathf.Max(maxStep, 0.15f);
+            var result = new List<Vector3>(path.Count * 2);
+
+            for (int i = 0; i < path.Count - 1; i++)
             {
-                for (int j = i + 4; j < path.Count; j++)
+                var a = path[i];
+                var b = path[i + 1];
+                if (result.Count == 0)
+                    result.Add(a);
+
+                float len = Vector3.Distance(a, b);
+                int splits = Mathf.Max(1, Mathf.CeilToInt(len / maxStep));
+                for (int s = 1; s <= splits; s++)
+                    result.Add(Vector3.Lerp(a, b, s / (float)splits));
+            }
+
+            return result;
+        }
+
+        // Coincident points produce zero-length tangents and garbage rings; drop them.
+        static void RemoveTinySteps(List<Vector3> path, float minStep)
+        {
+            float sqr = minStep * minStep;
+            for (int i = path.Count - 1; i >= 1; i--)
+            {
+                if (path.Count <= 2)
+                    return;
+                if ((path[i] - path[i - 1]).sqrMagnitude >= sqr)
+                    continue;
+
+                // Keep the endpoints: remove the inner point of the offending pair.
+                if (i == path.Count - 1)
+                    path.RemoveAt(i - 1);
+                else
+                    path.RemoveAt(i);
+            }
+        }
+
+        static List<Vector3> SmoothPathCorners(List<Vector3> path, int iterations, float factor, bool clampY)
+        {
+            if (path.Count < 3 || iterations <= 0)
+                return path;
+
+            var result = new List<Vector3>(path);
+            for (int it = 0; it < iterations; it++)
+            {
+                var copy = new List<Vector3>(result);
+                for (int i = 1; i < result.Count - 1; i++)
                 {
-                    if ((path[j] - path[i]).sqrMagnitude < sqr)
+                    var mid = (copy[i - 1] + copy[i + 1]) * 0.5f;
+                    var smoothed = Vector3.Lerp(copy[i], mid, factor);
+                    if (clampY)
                     {
-                        path.RemoveRange(i + 1, j - i - 1);
-                        break;
+                        float maxY = Mathf.Min(copy[i].y, copy[i - 1].y);
+                        if (smoothed.y > maxY)
+                            smoothed.y = maxY;
                     }
+
+                    result[i] = smoothed;
                 }
             }
+
+            return result;
+        }
+
+        static List<Vector3> SamplePathLinear(IReadOnlyList<Vector3> controlPoints, int samplesPerSegment)
+        {
+            var result = new List<Vector3>();
+            for (int i = 0; i < controlPoints.Count - 1; i++)
+            {
+                int steps = i == controlPoints.Count - 2 ? samplesPerSegment + 1 : samplesPerSegment;
+                int start = i == 0 ? 0 : 1;
+                for (int s = start; s < steps; s++)
+                {
+                    float t = s / (float)samplesPerSegment;
+                    result.Add(Vector3.Lerp(controlPoints[i], controlPoints[i + 1], t));
+                }
+            }
+
+            return result;
         }
 
         // Visual mesh: inner + outer shell + wall thickness caps (double-sided).
@@ -66,16 +178,43 @@ namespace WaterSlides
             if (path.Count < 2)
                 return null;
 
-            var frames = BuildFrames(path, settings.BankStrength, settings.Enclosure);
+            var vertices = new List<Vector3>();
+            var normals = new List<Vector3>();
+            var uvs = new List<Vector2>();
+            var triangles = new List<int>();
+
+            AppendTubeSegment(path, settings, vertices, normals, uvs, triangles);
+
+            if (vertices.Count == 0)
+                return null;
+
+            var mesh = new Mesh { name = "WaterSlide" };
+            mesh.indexFormat = UnityEngine.Rendering.IndexFormat.UInt32;
+            mesh.SetVertices(vertices);
+            mesh.SetNormals(normals);
+            mesh.SetUVs(0, uvs);
+            mesh.SetTriangles(triangles, 0);
+            mesh.RecalculateBounds();
+            return mesh;
+        }
+
+        static void AppendTubeSegment(
+            List<Vector3> segmentPath,
+            Settings settings,
+            List<Vector3> vertices,
+            List<Vector3> normals,
+            List<Vector2> uvs,
+            List<int> triangles)
+        {
+            if (segmentPath.Count < 2)
+                return;
+
+            int vertexBase = vertices.Count;
             int ringVerts = settings.RingSegments;
-            int rings = path.Count;
+            int rings = segmentPath.Count;
             bool isOpen = settings.Enclosure == SlideEnclosure.Open;
             int segmentCount = isOpen ? ringVerts - 1 : ringVerts;
-
-            var vertices = new List<Vector3>(rings * ringVerts * 2);
-            var normals = new List<Vector3>(rings * ringVerts * 2);
-            var uvs = new List<Vector2>(rings * ringVerts * 2);
-            var triangles = new List<int>();
+            var frames = BuildFrames(segmentPath, settings);
 
             for (int ring = 0; ring < rings; ring++)
             {
@@ -108,10 +247,10 @@ namespace WaterSlides
                 for (int seg = 0; seg < segmentCount; seg++)
                 {
                     int next = isOpen ? seg + 1 : (seg + 1) % ringVerts;
-                    int o0 = (ring * ringVerts + seg) * 2;
-                    int o1 = (ring * ringVerts + next) * 2;
-                    int o2 = ((ring + 1) * ringVerts + seg) * 2;
-                    int o3 = ((ring + 1) * ringVerts + next) * 2;
+                    int o0 = vertexBase + (ring * ringVerts + seg) * 2;
+                    int o1 = vertexBase + (ring * ringVerts + next) * 2;
+                    int o2 = vertexBase + ((ring + 1) * ringVerts + seg) * 2;
+                    int o3 = vertexBase + ((ring + 1) * ringVerts + next) * 2;
                     AddDoubleSidedQuad(triangles, o0, o1, o3, o2);
 
                     int i0 = o0 + 1;
@@ -122,39 +261,31 @@ namespace WaterSlides
                 }
             }
 
-            AddWallThicknessCaps(vertices, normals, uvs, triangles, rings, ringVerts, isOpen);
-
-            var mesh = new Mesh { name = "WaterSlide" };
-            mesh.SetVertices(vertices);
-            mesh.SetNormals(normals);
-            mesh.SetUVs(0, uvs);
-            mesh.SetTriangles(triangles, 0);
-            mesh.RecalculateBounds();
-            return mesh;
+            AddWallThicknessCaps(vertices, normals, uvs, triangles, vertexBase, rings, ringVerts, isOpen);
         }
 
         // A thin water ribbon sitting at a fill level inside the tube/flume, following the path.
-        // UV.x = width (0–1), UV.y = distance along the slide — matches Suimono flow along V.
+        // UV.x = width in meters (0..surface width), UV.y = distance along path in meters.
         public static Mesh BuildWaterSurface(IReadOnlyList<Vector3> controlPoints, Settings settings, float fillFraction)
         {
             var path = BuildProcessedPath(controlPoints, settings);
             if (path.Count < 2)
                 return null;
 
-            var frames = BuildFrames(path, settings.BankStrength, settings.Enclosure);
-            int rings = path.Count;
-
-            var vertices = new List<Vector3>(rings * 2);
-            var normals = new List<Vector3>(rings * 2);
-            var uvs = new List<Vector2>(rings * 2);
-            var triangles = new List<int>();
-
             ComputeWaterChord(settings, Mathf.Clamp01(fillFraction), out float waterY, out float halfChord);
             if (halfChord <= 0.001f)
                 return null;
 
+            var vertices = new List<Vector3>();
+            var normals = new List<Vector3>();
+            var uvs = new List<Vector2>();
+            var triangles = new List<int>();
+            float surfaceWidth = halfChord * 2f;
             float vAccum = 0f;
-            for (int ring = 0; ring < rings; ring++)
+
+            var frames = BuildFrames(path, settings);
+
+            for (int ring = 0; ring < path.Count; ring++)
             {
                 var frame = frames[ring];
                 if (ring > 0)
@@ -166,10 +297,10 @@ namespace WaterSlides
 
                 vertices.Add(ToWorld(frame, new Vector2(halfChord, waterY)));
                 normals.Add(frame.Up);
-                uvs.Add(new Vector2(1f, vAccum));
+                uvs.Add(new Vector2(surfaceWidth, vAccum));
             }
 
-            for (int ring = 0; ring < rings - 1; ring++)
+            for (int ring = 0; ring < path.Count - 1; ring++)
             {
                 int i0 = ring * 2;
                 int i1 = ring * 2 + 1;
@@ -179,12 +310,44 @@ namespace WaterSlides
             }
 
             var mesh = new Mesh { name = "WaterSlideWater" };
+            mesh.indexFormat = UnityEngine.Rendering.IndexFormat.UInt32;
             mesh.SetVertices(vertices);
             mesh.SetNormals(normals);
             mesh.SetUVs(0, uvs);
             mesh.SetTriangles(triangles, 0);
             mesh.RecalculateBounds();
             return mesh;
+        }
+
+        // Thin water ribbons fail Unity frustum culling up close; pad bounds without changing visuals.
+        public static void ExpandMeshBounds(Mesh mesh, float padding)
+        {
+            if (mesh == null || padding <= 0f)
+                return;
+
+            mesh.RecalculateBounds();
+            var center = mesh.bounds.center;
+            var extents = mesh.bounds.extents + Vector3.one * padding;
+
+            var vertices = new List<Vector3>(mesh.vertices);
+            var triangles = new List<int>(mesh.triangles);
+            int cornerBase = vertices.Count;
+
+            vertices.Add(center + new Vector3(-extents.x, -extents.y, -extents.z));
+            vertices.Add(center + new Vector3(extents.x, -extents.y, -extents.z));
+            vertices.Add(center + new Vector3(-extents.x, extents.y, -extents.z));
+            vertices.Add(center + new Vector3(extents.x, extents.y, -extents.z));
+            vertices.Add(center + new Vector3(-extents.x, -extents.y, extents.z));
+            vertices.Add(center + new Vector3(extents.x, -extents.y, extents.z));
+            vertices.Add(center + new Vector3(-extents.x, extents.y, extents.z));
+            vertices.Add(center + new Vector3(extents.x, extents.y, extents.z));
+
+            for (int i = 0; i < 8; i++)
+                triangles.AddRange(new[] { cornerBase + i, cornerBase + i, cornerBase + i });
+
+            mesh.SetVertices(vertices);
+            mesh.SetTriangles(triangles, 0);
+            mesh.RecalculateBounds();
         }
 
         // Exit point of the water ribbon at the end of the slide (for waterfalls / spill effects).
@@ -206,7 +369,7 @@ namespace WaterSlides
             if (path.Count < 2)
                 return false;
 
-            var frames = BuildFrames(path, settings.BankStrength, settings.Enclosure);
+            var frames = BuildFrames(path, settings);
             var frame = frames[^1];
             ComputeWaterChord(settings, Mathf.Clamp01(fillFraction), out float waterY, out float halfChord);
             if (halfChord <= 0.001f)
@@ -253,15 +416,17 @@ namespace WaterSlides
             if (path.Count < 2)
                 return null;
 
-            var frames = BuildFrames(path, settings.BankStrength, settings.Enclosure);
             int ringVerts = settings.RingSegments;
-            int rings = path.Count;
             bool isOpen = settings.Enclosure == SlideEnclosure.Open;
+            int segmentCount = isOpen ? ringVerts - 1 : ringVerts;
 
             var vertices = new List<Vector3>();
             var normals = new List<Vector3>();
             var uvs = new List<Vector2>();
             var triangles = new List<int>();
+
+            var frames = BuildFrames(path, settings);
+            int rings = path.Count;
 
             for (int ring = 0; ring < rings; ring++)
             {
@@ -286,7 +451,6 @@ namespace WaterSlides
 
             for (int ring = 0; ring < rings - 1; ring++)
             {
-                int segmentCount = isOpen ? ringVerts - 1 : ringVerts;
                 for (int seg = 0; seg < segmentCount; seg++)
                 {
                     int next = isOpen ? seg + 1 : (seg + 1) % ringVerts;
@@ -300,6 +464,7 @@ namespace WaterSlides
             }
 
             var mesh = new Mesh { name = "WaterSlideRideSurface" };
+            mesh.indexFormat = UnityEngine.Rendering.IndexFormat.UInt32;
             mesh.SetVertices(vertices);
             mesh.SetNormals(normals);
             mesh.SetUVs(0, uvs);
@@ -397,6 +562,41 @@ namespace WaterSlides
             return (controlPoints[controlPoints.Count - 1] - controlPoints[controlPoints.Count - 2]).normalized;
         }
 
+        public static bool TryGetRideStartPose(
+            IReadOnlyList<Vector3> controlPoints,
+            Settings settings,
+            float heightAboveSurface,
+            float bodyClearance,
+            out Vector3 position,
+            out Vector3 forward)
+        {
+            position = default;
+            forward = Vector3.forward;
+
+            var path = BuildProcessedPath(controlPoints, settings);
+            if (path.Count < 2)
+                return false;
+
+            var frames = BuildFrames(path, settings);
+            var frame = frames[0];
+            forward = frame.Forward.sqrMagnitude > 1e-6f ? frame.Forward.normalized : Vector3.forward;
+
+            float floorT = settings.Enclosure == SlideEnclosure.Open
+                ? 0.345f * SlideCrossSection.OpenProfileMaxT
+                : 0.25f;
+
+            SampleCrossSection(settings, floorT, outer: false, out var profile, out var profileNormal);
+            var surfacePoint = ToWorld(frame, profile);
+            var surfaceUp = -ToWorldNormal(frame, profileNormal);
+            if (surfaceUp.sqrMagnitude < 1e-6f)
+                surfaceUp = settings.Enclosure == SlideEnclosure.Open ? Vector3.up : frame.Up;
+            surfaceUp.Normalize();
+
+            float clearance = Mathf.Max(heightAboveSurface, 0.5f) + Mathf.Max(bodyClearance, 0f);
+            position = surfacePoint + surfaceUp * clearance + forward * 0.2f;
+            return true;
+        }
+
         struct Frame
         {
             public Vector3 Position;
@@ -432,11 +632,14 @@ namespace WaterSlides
             return result;
         }
 
-        static List<Frame> BuildFrames(List<Vector3> path, float bankStrength, SlideEnclosure enclosure)
+        // Open flumes must stay upright (water inside), so up is world up and right is the
+        // horizontal perpendicular. Closed tubes use parallel transport so the ring plane
+        // stays perpendicular to the path even through vertical loops.
+        static List<Frame> BuildFrames(List<Vector3> path, in Settings settings)
         {
             var frames = new List<Frame>(path.Count);
             float prevBank = 0f;
-            bool isOpen = enclosure == SlideEnclosure.Open;
+            bool isOpen = settings.Enclosure == SlideEnclosure.Open;
 
             for (int i = 0; i < path.Count; i++)
             {
@@ -456,7 +659,7 @@ namespace WaterSlides
                     else
                         up = ParallelTransport(frames[i - 1].Up, frames[i - 1].Forward, forward);
 
-                    float targetBank = ComputeBankAngle(path, i) * bankStrength;
+                    float targetBank = ComputeBankAngle(path, i) * settings.BankStrength;
                     prevBank = i == 0 ? targetBank : Mathf.Lerp(prevBank, targetBank, 0.3f);
                     up = Quaternion.AngleAxis(prevBank, forward) * up;
 
@@ -482,7 +685,10 @@ namespace WaterSlides
         {
             Vector3 right;
             var cross = Vector3.Cross(Vector3.up, forward);
-            if (cross.sqrMagnitude > 1e-4f)
+
+            // Near-vertical tangents make the cross product unstable (its direction is set by a
+            // tiny horizontal remainder) — reuse the previous ring's right to avoid ring twisting.
+            if (cross.sqrMagnitude > 1e-2f)
                 right = cross.normalized;
             else if (index > 0)
                 right = frames[index - 1].Right;
@@ -500,8 +706,9 @@ namespace WaterSlides
             if (path.Count < 2)
                 return;
 
+            // The entry ramp may ascend; protect it in full (it can span many densified points).
             int rampEnd = 0;
-            for (int i = 1; i < Mathf.Min(5, path.Count); i++)
+            for (int i = 1; i < path.Count; i++)
             {
                 if (path[i].y >= path[i - 1].y - 0.01f)
                     rampEnd = i;
@@ -557,26 +764,33 @@ namespace WaterSlides
             return Mathf.Clamp(turn * 0.55f, -32f, 32f);
         }
 
+        // Caps are only added where the wall interior would otherwise be visible:
+        // - the ring annulus at the FIRST and LAST ring (tube ends),
+        // - and, on open flumes, the top edge of both walls along the whole path.
+        // Adding cross-section caps on every interior ring (as before) buries thousands of
+        // hidden quads inside the wall and, on twisted rings, shows up as rungs across the flume.
         static void AddWallThicknessCaps(
             List<Vector3> vertices,
             List<Vector3> normals,
             List<Vector2> uvs,
             List<int> triangles,
+            int vertexBase,
             int rings,
             int ringVerts,
             bool isOpen)
         {
             int segmentCount = isOpen ? ringVerts - 1 : ringVerts;
 
-            // Own vertices + face normals so shell normals are not averaged (RecalculateNormals breaks shading).
-            for (int ring = 0; ring < rings; ring++)
+            // End caps: seal the wall annulus at both tube ends (full profile, no gaps).
+            for (int e = 0; e < 2; e++)
             {
+                int ring = e == 0 ? 0 : rings - 1;
                 float v = ring / (float)(rings - 1);
                 for (int seg = 0; seg < segmentCount; seg++)
                 {
                     int next = isOpen ? seg + 1 : (seg + 1) % ringVerts;
-                    int o0 = (ring * ringVerts + seg) * 2;
-                    int o1 = (ring * ringVerts + next) * 2;
+                    int o0 = vertexBase + (ring * ringVerts + seg) * 2;
+                    int o1 = vertexBase + (ring * ringVerts + next) * 2;
                     int i0 = o0 + 1;
                     int i1 = o1 + 1;
                     float u = seg / (float)Mathf.Max(segmentCount - 1, 1);
@@ -586,19 +800,24 @@ namespace WaterSlides
                 }
             }
 
+            if (!isOpen)
+                return;
+
+            // Wall-top bands: close the gap between inner and outer shell along the top edge
+            // of the left (seg 0) and right (seg ringVerts-1) lips.
             for (int ring = 0; ring < rings - 1; ring++)
             {
                 float v = ring / (float)(rings - 1);
-                for (int seg = 0; seg < ringVerts; seg++)
+                for (int k = 0; k < 2; k++)
                 {
-                    int o0 = (ring * ringVerts + seg) * 2;
-                    int o2 = ((ring + 1) * ringVerts + seg) * 2;
+                    int seg = k == 0 ? 0 : ringVerts - 1;
+                    int o0 = vertexBase + (ring * ringVerts + seg) * 2;
+                    int o2 = vertexBase + ((ring + 1) * ringVerts + seg) * 2;
                     int i0 = o0 + 1;
                     int i2 = o2 + 1;
-                    float u = seg / (float)Mathf.Max(ringVerts - 1, 1);
                     AddCapQuad(vertices, normals, uvs, triangles,
                         vertices[i0], vertices[o0], vertices[o2], vertices[i2],
-                        new Vector2(u, v));
+                        new Vector2(k, v));
                 }
             }
         }
