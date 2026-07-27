@@ -5,6 +5,7 @@ namespace WaterSlides
     [ExecuteAlways]
     public class WaterSlideDemoSetup : MonoBehaviour
     {
+        [Tooltip("Автоматически выполнять настройку демо-сцены (свет, курс горок, камера) при включении объекта.")]
         public bool SetupOnEnable = true;
 
         void OnEnable()
@@ -45,7 +46,6 @@ namespace WaterSlides
                 course = courseGo.AddComponent<WaterSlideCourse>();
                 course.SlideCount = 3;
                 course.JumpGap = new FloatRange { Min = 5f, Max = 8f };
-                course.JumpDrop = new FloatRange { Min = 0.75f, Max = 2f };
                 course.SlideLength = new FloatRange { Min = 50f, Max = 60f };
                 course.SlideDrop = new FloatRange { Min = 16f, Max = 22f };
                 course.AllowLoopsAndSpirals = false;

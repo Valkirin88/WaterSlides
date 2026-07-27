@@ -61,11 +61,23 @@ namespace WaterSlides
             // Loops go up/over (vertical) or already descend by construction (horizontal
             // helix), so the "always descend" clamps must not touch them.
             bool clampY = !settings.PreserveVerticalMotion && !settings.HasLoop;
-            path = SmoothPathCorners(path, iterations: 3, factor: 0.3f, clampY);
-            float ringSpacing = Mathf.Clamp(0.55f - settings.SamplesPerSegment * 0.02f, 0.28f, 0.55f);
-            path = DensifyPathLinear(path, ringSpacing);
+
+            // Chaikin corner cutting instead of neighbour averaging: each pass replaces
+            // every corner with points at 1/4 and 3/4 of the adjacent segments, and the
+            // polyline converges to a smooth quadratic B-spline. Every new point is a
+            // convex combination of the inputs, so the curve never overshoots — loops
+            // keep their shape (the reason Catmull-Rom was rejected) and a descending
+            // path stays descending with no per-point Y-clamps (whose kinks were visible
+            // in the old averaging smoother).
+            path = ChaikinSmooth(path, iterations: 4);
+
+            // Ring spacing sets the dihedral angle at every ring seam of the collision
+            // mesh — the angle the sliding capsule "hits" when crossing a seam. The old
+            // 0.28–0.55 m spacing made every seam a small step at riding speed (felt as
+            // constant bumping); denser rings shrink those impacts quadratically.
+            float ringSpacing = Mathf.Clamp(0.22f - settings.SamplesPerSegment * 0.008f, 0.12f, 0.22f);
+            path = ResampleUniform(path, ringSpacing);
             RemoveTinySteps(path, 0.02f);
-            path = StabilizePath(path, clampY);
             if (clampY)
                 EnforcePathMonotonicDescent(path);
 
@@ -84,26 +96,61 @@ namespace WaterSlides
             return SamplePathLinear(controlPoints, samplesPerSegment);
         }
 
-        static List<Vector3> DensifyPathLinear(List<Vector3> path, float maxStep)
+        static List<Vector3> ChaikinSmooth(List<Vector3> path, int iterations)
+        {
+            if (path.Count < 3 || iterations <= 0)
+                return path;
+
+            var current = path;
+            for (int it = 0; it < iterations; it++)
+            {
+                var next = new List<Vector3>(current.Count * 2) { current[0] };
+                for (int i = 0; i < current.Count - 1; i++)
+                {
+                    Vector3 a = current[i];
+                    Vector3 b = current[i + 1];
+                    next.Add(Vector3.Lerp(a, b, 0.25f));
+                    next.Add(Vector3.Lerp(a, b, 0.75f));
+                }
+
+                next.Add(current[^1]);
+                current = next;
+            }
+
+            return current;
+        }
+
+        // Even arc-length sampling (works both up and down in density): rings spaced
+        // unevenly along the path make the tube tessellation — and the ride feel —
+        // depend on where the control points happened to be.
+        static List<Vector3> ResampleUniform(List<Vector3> path, float spacing)
         {
             if (path.Count < 2)
                 return path;
 
-            maxStep = Mathf.Max(maxStep, 0.15f);
-            var result = new List<Vector3>(path.Count * 2);
+            spacing = Mathf.Max(spacing, 0.05f);
+            var result = new List<Vector3> { path[0] };
+            float distToNext = spacing;
 
             for (int i = 0; i < path.Count - 1; i++)
             {
-                var a = path[i];
-                var b = path[i + 1];
-                if (result.Count == 0)
-                    result.Add(a);
+                Vector3 a = path[i];
+                Vector3 b = path[i + 1];
+                float segLen = Vector3.Distance(a, b);
+                float traversed = 0f;
 
-                float len = Vector3.Distance(a, b);
-                int splits = Mathf.Max(1, Mathf.CeilToInt(len / maxStep));
-                for (int s = 1; s <= splits; s++)
-                    result.Add(Vector3.Lerp(a, b, s / (float)splits));
+                while (segLen - traversed >= distToNext)
+                {
+                    traversed += distToNext;
+                    result.Add(Vector3.Lerp(a, b, traversed / segLen));
+                    distToNext = spacing;
+                }
+
+                distToNext -= segLen - traversed;
             }
+
+            if ((result[^1] - path[^1]).sqrMagnitude > 1e-8f)
+                result.Add(path[^1]);
 
             return result;
         }
@@ -125,33 +172,6 @@ namespace WaterSlides
                 else
                     path.RemoveAt(i);
             }
-        }
-
-        static List<Vector3> SmoothPathCorners(List<Vector3> path, int iterations, float factor, bool clampY)
-        {
-            if (path.Count < 3 || iterations <= 0)
-                return path;
-
-            var result = new List<Vector3>(path);
-            for (int it = 0; it < iterations; it++)
-            {
-                var copy = new List<Vector3>(result);
-                for (int i = 1; i < result.Count - 1; i++)
-                {
-                    var mid = (copy[i - 1] + copy[i + 1]) * 0.5f;
-                    var smoothed = Vector3.Lerp(copy[i], mid, factor);
-                    if (clampY)
-                    {
-                        float maxY = Mathf.Min(copy[i].y, copy[i - 1].y);
-                        if (smoothed.y > maxY)
-                            smoothed.y = maxY;
-                    }
-
-                    result[i] = smoothed;
-                }
-            }
-
-            return result;
         }
 
         static List<Vector3> SamplePathLinear(IReadOnlyList<Vector3> controlPoints, int samplesPerSegment)
@@ -487,73 +507,6 @@ namespace WaterSlides
         static Vector3 ToWorldNormal(Frame frame, Vector2 profileNormal) =>
             (frame.Right * profileNormal.x + frame.Up * profileNormal.y).normalized;
 
-        public static List<Vector3> SamplePath(IReadOnlyList<Vector3> controlPoints, int samplesPerSegment)
-        {
-            var result = new List<Vector3>();
-            if (controlPoints == null || controlPoints.Count < 2)
-                return result;
-
-            if (controlPoints.Count == 2)
-            {
-                int steps = samplesPerSegment + 1;
-                for (int i = 0; i < steps; i++)
-                    result.Add(Vector3.Lerp(controlPoints[0], controlPoints[1], i / (float)(steps - 1)));
-                return result;
-            }
-
-            for (int i = 0; i < controlPoints.Count - 1; i++)
-            {
-                var p0 = controlPoints[Mathf.Max(i - 1, 0)];
-                var p1 = controlPoints[i];
-                var p2 = controlPoints[i + 1];
-                var p3 = controlPoints[Mathf.Min(i + 2, controlPoints.Count - 1)];
-
-                int steps = i == controlPoints.Count - 2 ? samplesPerSegment + 1 : samplesPerSegment;
-                int start = i == 0 ? 0 : 1;
-
-                for (int s = start; s < steps; s++)
-                {
-                    float t = s / (float)samplesPerSegment;
-                    result.Add(CentripetalCatmullRom(p0, p1, p2, p3, t));
-                }
-            }
-
-            return result;
-        }
-
-        static Vector3 CentripetalCatmullRom(Vector3 p0, Vector3 p1, Vector3 p2, Vector3 p3, float t)
-        {
-            const float alpha = 0.5f;
-            float t0 = 0f;
-            float t1 = t0 + SplineKnot(p0, p1, alpha);
-            float t2 = t1 + SplineKnot(p1, p2, alpha);
-            float t3 = t2 + SplineKnot(p2, p3, alpha);
-
-            if (t2 - t1 < 1e-5f)
-                return Vector3.Lerp(p1, p2, t);
-
-            float tt = Mathf.Lerp(t1, t2, t);
-            var a1 = SplineLerp(p0, p1, t0, t1, tt);
-            var a2 = SplineLerp(p1, p2, t1, t2, tt);
-            var a3 = SplineLerp(p2, p3, t2, t3, tt);
-            var b1 = SplineLerp(a1, a2, t0, t2, tt);
-            var b2 = SplineLerp(a2, a3, t1, t3, tt);
-            return SplineLerp(b1, b2, t1, t2, tt);
-        }
-
-        static float SplineKnot(Vector3 a, Vector3 b, float alpha)
-        {
-            float d = (b - a).sqrMagnitude;
-            return d < 1e-8f ? 1e-4f : Mathf.Pow(d, 0.5f * alpha);
-        }
-
-        static Vector3 SplineLerp(Vector3 a, Vector3 b, float ta, float tb, float t)
-        {
-            if (Mathf.Abs(tb - ta) < 1e-6f)
-                return a;
-            return a + (b - a) * ((t - ta) / (tb - ta));
-        }
-
         public static Vector3 GetPathEndTangent(IReadOnlyList<Vector3> controlPoints)
         {
             if (controlPoints == null || controlPoints.Count < 2)
@@ -578,22 +531,33 @@ namespace WaterSlides
                 return false;
 
             var frames = BuildFrames(path, settings);
-            var frame = frames[0];
+
+            // The first slide begins with an ASCENDING launch ramp. Spawning above its lowest
+            // ring dropped the player onto an up-slope (downhill points back off the entry
+            // edge), and applying the clearance along the tilted floor normal pushed the spawn
+            // point BEHIND the slide — the body fell past the entrance entirely. Spawn above
+            // the CREST of the ramp instead: the first ring where the path starts descending.
+            int startIndex = 0;
+            while (startIndex < frames.Count - 1
+                   && frames[startIndex + 1].Position.y >= frames[startIndex].Position.y - 0.001f)
+                startIndex++;
+            startIndex = Mathf.Min(startIndex + 1, frames.Count - 1);
+
+            var frame = frames[startIndex];
             forward = frame.Forward.sqrMagnitude > 1e-6f ? frame.Forward.normalized : Vector3.forward;
 
+            // t=0.5 is the BOTTOM of the closed-tube ring (t=0.25 was its side wall).
             float floorT = settings.Enclosure == SlideEnclosure.Open
                 ? 0.345f * SlideCrossSection.OpenProfileMaxT
-                : 0.25f;
+                : 0.5f;
 
-            SampleCrossSection(settings, floorT, outer: false, out var profile, out var profileNormal);
+            SampleCrossSection(settings, floorT, outer: false, out var profile, out _);
             var surfacePoint = ToWorld(frame, profile);
-            var surfaceUp = -ToWorldNormal(frame, profileNormal);
-            if (surfaceUp.sqrMagnitude < 1e-6f)
-                surfaceUp = settings.Enclosure == SlideEnclosure.Open ? Vector3.up : frame.Up;
-            surfaceUp.Normalize();
 
+            // Clearance straight up in WORLD space: the drop is vertical, so the body lands
+            // exactly on the sampled floor point regardless of the ramp tilt.
             float clearance = Mathf.Max(heightAboveSurface, 0.5f) + Mathf.Max(bodyClearance, 0f);
-            position = surfacePoint + surfaceUp * clearance + forward * 0.2f;
+            position = surfacePoint + Vector3.up * clearance;
             return true;
         }
 
@@ -603,33 +567,6 @@ namespace WaterSlides
             public Vector3 Forward;
             public Vector3 Right;
             public Vector3 Up;
-        }
-
-        static List<Vector3> StabilizePath(List<Vector3> path, bool clampY)
-        {
-            if (path.Count < 3)
-                return path;
-
-            var result = new List<Vector3>(path);
-            for (int i = 1; i < result.Count - 1; i++)
-            {
-                var incoming = (result[i] - result[i - 1]).normalized;
-                var outgoing = (result[i + 1] - result[i]).normalized;
-                if (Vector3.Angle(incoming, outgoing) > 42f)
-                {
-                    var mid = (result[i - 1] + result[i + 1]) * 0.5f;
-                    var smoothed = Vector3.Lerp(result[i], mid, 0.22f);
-                    if (clampY)
-                    {
-                        float maxY = Mathf.Min(result[i].y, result[i - 1].y);
-                        if (smoothed.y > maxY)
-                            smoothed.y = maxY;
-                    }
-                    result[i] = smoothed;
-                }
-            }
-
-            return result;
         }
 
         // Open flumes must stay upright (water inside), so up is world up and right is the
@@ -718,7 +655,15 @@ namespace WaterSlides
 
             for (int i = rampEnd + 1; i < path.Count; i++)
             {
-                float maxY = path[i - 1].y - 0.05f;
+                // Grade-proportional (12%), NOT a fixed drop per point: a constant
+                // per-point drop turns into a sawtooth as soon as the sampling gets
+                // denser. The grade is measured over the HORIZONTAL projection only —
+                // it is unaffected by the Y-clamp below. Using the full 3D distance fed
+                // the clamp back into itself: on ascending stretches every clamp grew
+                // the next step, and the heights ran away exponentially to -infinity.
+                Vector3 delta = path[i] - path[i - 1];
+                float horizontal = Mathf.Sqrt(delta.x * delta.x + delta.z * delta.z);
+                float maxY = path[i - 1].y - 0.12f * horizontal;
                 if (path[i].y > maxY)
                     path[i] = new Vector3(path[i].x, maxY, path[i].z);
             }
@@ -761,7 +706,14 @@ namespace WaterSlides
             var prev = GetTangent(path, i - 1);
             var next = GetTangent(path, i + 1);
             float turn = Vector3.SignedAngle(prev, next, Vector3.up);
-            return Mathf.Clamp(turn * 0.55f, -32f, 32f);
+            float span = Vector3.Distance(path[i - 1], path[i + 1]);
+            if (span < 1e-4f)
+                return 0f;
+
+            // Degrees of turn per METRE of path, not per point: a per-point angle
+            // collapses towards zero whenever the sampling density goes up, and the
+            // tubes silently lose their banking.
+            return Mathf.Clamp(turn / span * 0.45f, -32f, 32f);
         }
 
         // Caps are only added where the wall interior would otherwise be visible:

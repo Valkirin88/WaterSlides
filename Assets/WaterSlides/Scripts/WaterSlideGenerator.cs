@@ -7,6 +7,7 @@ namespace WaterSlides
     public class WaterSlideGenerator : MonoBehaviour
     {
         [Header("Path")]
+        [Tooltip("Опорные точки пути горки (в локальных координатах); по ним строится центральная линия трубы/жёлоба.")]
         public List<Vector3> ControlPoints = new()
         {
             new(0f, 20f, 0f),
@@ -19,35 +20,49 @@ namespace WaterSlides
         };
 
         [Header("Type")]
+        [Tooltip("Тип сечения горки: открытый жёлоб или закрытая труба.")]
         public SlideEnclosure Enclosure = SlideEnclosure.Open;
 
         [Header("Closed Tube (32\" commercial scale)")]
+        [Tooltip("Радиус закрытой трубы (метры).")]
         [Min(0.3f)] public float TubeRadius = 0.52f;
 
         [Tooltip("Толщина стенки закрытой трубы (метры).")]
         [Range(0.03f, 1.5f)] public float WallThickness = 0.08f;
 
         [Header("Open Flume (42\" commercial scale)")]
+        [Tooltip("Форма сечения открытого жёлоба: прямоугольная или скруглённая.")]
         public OpenFlumeShape OpenShape = OpenFlumeShape.Square;
+        [Tooltip("Ширина открытого жёлоба (метры); задаёт и боковой предел для катания игрока.")]
         [Min(0.6f)] public float FlumeWidth = 1.07f;
+        [Tooltip("Глубина открытого жёлоба (метры).")]
         [Min(0.15f)] public float FlumeDepth = 0.32f;
+        [Tooltip("Высота бортика по краям открытого жёлоба (метры).")]
         [Min(0.1f)] public float FlumeLipHeight = 0.28f;
+        [Tooltip("Радиус скругления углов сечения открытого жёлоба (метры).")]
         [Min(0.05f)] public float FlumeCornerRadius = 0.14f;
+        [Tooltip("Вынос (свес) верхней кромки борта наружу открытого жёлоба (метры).")]
         [Min(0f)] public float CopingOverhang = 0f;
 
         [Tooltip("Толщина дна, бортов и бортика открытого жёлоба (метры).")]
         [Range(0.03f, 1.5f)] public float FlumeWallThickness = 0.1f;
 
         [Header("Mesh Quality")]
+        [Tooltip("Число сегментов в кольце сечения; больше — глаже стенки, но тяжелее меш.")]
         [Range(8, 40)] public int RingSegments = 24;
+        [Tooltip("Число выборок пути между опорными точками; больше — плотнее и глаже кольца вдоль горки.")]
         [Range(4, 32)] public int SamplesPerSegment = 14;
+        [Tooltip("Сила наклона (виража) трубы в поворотах; 0 — без наклона.")]
         [Range(0f, 1.5f)] public float BankStrength = 1f;
 
         [Header("Appearance")]
+        [Tooltip("Цвет материала горки.")]
         public Color SlideColor = new(0.15f, 0.75f, 0.95f, 1f);
+        [Tooltip("Материал горки; если не задан, создаётся стандартный материал автоматически.")]
         public Material SlideMaterial;
 
         [Header("Runtime")]
+        [Tooltip("Создавать MeshCollider поверхности катания для физики игрока.")]
         public bool GenerateCollider = true;
 
         [Tooltip("Keep up/over vertical motion (vertical loops). Disables the 'always descend' clamp on the mesh path.")]
@@ -55,9 +70,6 @@ namespace WaterSlides
 
         [Tooltip("Set when this slide contains a loop segment (disables the 'always descend' clamp on the mesh path).")]
         public bool HasLoop;
-
-        [HideInInspector] public int LoopPathStart = -1;
-        [HideInInspector] public int LoopPathEnd = -1;
 
         MeshFilter _meshFilter;
         MeshRenderer _meshRenderer;
@@ -81,22 +93,12 @@ namespace WaterSlides
         // from the centreline before being pushed back.
         public float RideHalfWidth => Enclosure == SlideEnclosure.Open ? FlumeWidth * 0.5f : TubeRadius;
 
-        public Vector3 StartPosition => ControlPoints.Count > 0 ? ControlPoints[0] : transform.position;
         public Vector3 EndPosition => ControlPoints.Count > 0 ? ControlPoints[^1] : transform.position;
         public Vector3 EndTangent => WaterSlideMeshBuilder.GetPathEndTangent(ControlPoints);
 
-        // World-space endpoints of the ACTUAL rendered centreline (after smoothing + descent
+        // World-space end of the ACTUAL rendered centreline (after smoothing + descent
         // clamping). The mesh can push the end lower than the raw control point, so connections
         // must use these to stay aligned with what is drawn.
-        public Vector3 ProcessedWorldStart
-        {
-            get
-            {
-                var p = WaterSlideMeshBuilder.BuildProcessedPath(GetWorldControlPoints(), BuildMeshSettings());
-                return p.Count > 0 ? p[0] : transform.TransformPoint(StartPosition);
-            }
-        }
-
         public Vector3 ProcessedWorldEnd
         {
             get
@@ -114,18 +116,6 @@ namespace WaterSlides
                 if (p.Count < 2)
                     return transform.TransformDirection(EndTangent);
                 var dir = p[^1] - p[^2];
-                return dir.sqrMagnitude > 1e-6f ? dir.normalized : Vector3.forward;
-            }
-        }
-
-        public Vector3 ProcessedWorldStartTangent
-        {
-            get
-            {
-                var p = WaterSlideMeshBuilder.BuildProcessedPath(GetWorldControlPoints(), BuildMeshSettings());
-                if (p.Count < 2)
-                    return transform.forward;
-                var dir = p[1] - p[0];
                 return dir.sqrMagnitude > 1e-6f ? dir.normalized : Vector3.forward;
             }
         }
@@ -183,7 +173,9 @@ namespace WaterSlides
                     continue;
 
                 bestDist = hit.distance;
-                bestPoint = hit.point + hit.normal * clearance + forward.normalized * 0.15f;
+                // World-up clearance: along the surface normal the point drifts off the
+                // slide on tilted entry ramps, and the vertical drop then misses the flume.
+                bestPoint = hit.point + Vector3.up * clearance + forward.normalized * 0.15f;
                 found = true;
             }
 

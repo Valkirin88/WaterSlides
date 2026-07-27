@@ -34,11 +34,17 @@ namespace WaterSlides
         public bool LiveUpdate = true;
 
         [Header("Connection Between Slides")]
-        [Tooltip("Дистанция прыжка вдоль направления вылета с конца предыдущей горки (метры).")]
+        [Tooltip("Желаемая дистанция прыжка вдоль направления вылета с конца предыдущей горки (метры). Может быть урезана, если баллистика при расчётной скорости вылета не дотягивает (см. AssumedExitSpeed и MaxJumpDrop).")]
         public FloatRange JumpGap = new() { Min = 4f, Max = 9f };
 
-        [Tooltip("Просадка точки приземления вниз за время прыжка (гравитация). Вход следующей трубы целится по хорде прыжка.")]
-        public FloatRange JumpDrop = new() { Min = 0.5f, Max = 2.5f };
+        [Tooltip("Расчётная скорость вылета с горки, м/с. Вход следующей горки ставится на баллистической дуге под ЭТУ скорость и фактическую гравитацию игрока. ВАЖНО: держи близко к реальной скорости вылета (обычно у потолка _maxSlideSpeed ≈ 16). Слишком МАЛО — дуга крутая, вход ставится близко и низко, а реально быстрый игрок летит полого и ПЕРЕЛЕТАЕТ его. Слишком МНОГО — заторможенный на поворотах вылет не дотянет и упадёт в провал. 14 — компромисс с лёгким запасом на торможение.")]
+        [Min(3f)] public float AssumedExitSpeed = 14f;
+
+        [Tooltip("Минимальная просадка входа следующей горки вниз относительно конца предыдущей, м.")]
+        [Min(0.5f)] public float MinJumpDrop = 1.5f;
+
+        [Tooltip("Максимальная просадка входа следующей горки вниз, м. Если баллистике при расчётной скорости нужно упасть глубже — дистанция прыжка урезается, чтобы вписаться в этот предел. Это ГЛАВНЫЙ ограничитель того, как далеко разлетаются горки: дальше по горизонтали = физически ниже (баллистика), поэтому маленький предел жмёт горки близко. Больше — горки дальше и с более глубокими провалами между ними.")]
+        [Min(1f)] public float MaxJumpDrop = 16f;
 
         [Tooltip("Диапазон смещения начала следующей трубы по оси X (мировые координаты, метры).")]
         public FloatRange JumpOffsetX = new() { Min = -3f, Max = 3f };
@@ -75,8 +81,11 @@ namespace WaterSlides
         [Tooltip("Добавлять петли некоторым горкам (не всем).")]
         public bool EnableLoops = true;
 
-        [Tooltip("Вероятность того, что у горки будет петля.")]
+        [Tooltip("Вероятность того, что у горки будут петли.")]
         [Range(0f, 1f)] public float LoopChancePerSlide = 0.4f;
+
+        [Tooltip("Сколько петель на горке, когда петли выпали. Петли могут идти подряд, одна сразу за другой.")]
+        public IntRange LoopsPerSlide = new() { Min = 1, Max = 2 };
 
         [Tooltip("Разрешить вертикальные петли (труба идёт вверх и через верх). Только закрытые трубы.")]
         public bool AllowVerticalLoops = true;
@@ -86,6 +95,19 @@ namespace WaterSlides
 
         [Tooltip("Радиус петель (метры).")]
         public FloatRange LoopRadius = new() { Min = 3.5f, Max = 6f };
+
+        [Header("Exit Kick")]
+        [Tooltip("Шанс загнуть конец горки ВВЕРХ (трамплин): игрока подбрасывает вверх, но в направлении входа следующей горки.")]
+        [Range(0f, 1f)] public float ExitKickChance = 0.35f;
+
+        [Tooltip("Шанс загнуть конец ВНИЗ под углом хорды прыжка — вылет идёт сразу по направлению на вход следующей горки. Оставшаяся вероятность — прямой конец.")]
+        [Range(0f, 1f)] public float ExitMatchChance = 0.3f;
+
+        [Tooltip("Угол загиба конца вверх, градусы.")]
+        public FloatRange ExitKickAngle = new() { Min = 12f, Max = 24f };
+
+        [Tooltip("Длина загнутого участка, метры.")]
+        public FloatRange ExitKickLength = new() { Min = 2f, Max = 3.5f };
 
         [Header("Thickness")]
         [Tooltip("Общий множитель размеров сечения (радиус, ширина жёлоба). Не влияет на толщину стенок.")]
@@ -133,8 +155,9 @@ namespace WaterSlides
         public bool WaterfallOnLastSlide = true;
 
         [Header("Slide Types")]
-        [Tooltip("Разрешить закрытые трубы среди открытых горок (первая всё равно открытая).")]
-        public bool MixOpenAndClosed = true;
+        [Tooltip("Разрешить закрытые трубы. Выкл — весь курс из открытых жёлобов; вертикальные петли (им нужна труба) тоже отключаются. Первая горка всегда открытая.")]
+        [FormerlySerializedAs("MixOpenAndClosed")]
+        public bool AllowClosedTubes = true;
 
         [Tooltip("Вероятность закрытой горки (0 = только открытые, 1 = только закрытые). Первая горка всегда открытая.")]
         [Range(0f, 1f)] public float ClosedSlideChance = 0.25f;
@@ -173,6 +196,59 @@ namespace WaterSlides
         WaterSlideWater _waterPreset;
 
         public IReadOnlyList<WaterSlideGenerator> Slides => _slides;
+
+        // Speed needed to clear ANY jump of this course, with a small margin. The jumps
+        // are PLACED from ballistics for AssumedExitSpeed under the player's actual
+        // gravity (see Build), so that speed is the guarantee by construction — no
+        // geometry-derived estimate needed, and no extra gravity scaling on the consumer
+        // side (the placement already used the real player gravity).
+        public float RequiredJumpSpeed => Mathf.Max(AssumedExitSpeed, 3f) * 1.05f;
+
+        // Gravity the PLAYER actually flies under: scene gravity times the extra
+        // multiplier on PlayerView. The placement must use the same value, otherwise
+        // arcs computed here undershoot the real (heavier) flight.
+        static float PlayerGravity()
+        {
+            float g = Mathf.Max(Mathf.Abs(Physics.gravity.y), 0.1f);
+            var player = FindFirstObjectByType<PlayerView>(FindObjectsInactive.Include);
+            return player != null ? g * player.GravityMultiplier : g;
+        }
+
+        // The player's cornering physics for the path generator's speed-aware fairness
+        // (corner limit √(grip·R), braking distance before sharp turns). Read from the
+        // actual PlayerView so scene tweaks propagate; defaults match its script values.
+        static void GetPlayerCornering(out float grip, out float brake, out float speedCap)
+        {
+            grip = 20f;
+            brake = 12f;
+            speedCap = 16f;
+            var player = FindFirstObjectByType<PlayerView>(FindObjectsInactive.Include);
+            if (player == null)
+                return;
+
+            grip = player.CorneringGrip;
+            brake = player.BrakeDeceleration;
+            speedCap = player.MaxRideSpeed;
+        }
+
+        // How far below the launch point the flight arc is at the given horizontal
+        // distance. launchDownDeg — launch angle below horizontal (negative = upward).
+        static float BallisticDropAt(float distance, float speed, float launchDownDeg, float gravity)
+        {
+            float rad = launchDownDeg * Mathf.Deg2Rad;
+            float horizontalSpeed = Mathf.Max(speed * Mathf.Cos(rad), 0.5f);
+            float t = distance / horizontalSpeed;
+            return speed * Mathf.Sin(rad) * t + 0.5f * gravity * t * t;
+        }
+
+        // Horizontal distance at which the same arc has fallen by the given drop.
+        static float BallisticDistanceAt(float drop, float speed, float launchDownDeg, float gravity)
+        {
+            float rad = launchDownDeg * Mathf.Deg2Rad;
+            float downSpeed = speed * Mathf.Sin(rad);
+            float t = (-downSpeed + Mathf.Sqrt(downSpeed * downSpeed + 2f * gravity * Mathf.Max(drop, 0.01f))) / gravity;
+            return Mathf.Max(speed * Mathf.Cos(rad), 0.5f) * t;
+        }
 
         public bool IsReadyForPlayerSpawn(float heightOffset, float bodyClearance)
         {
@@ -331,15 +407,17 @@ namespace WaterSlides
             var rng = new System.Random(seed);
             Vector3 cursorPos = transform.position + Vector3.up * 25f;
             Vector3 pendingEntryDir = Vector3.zero;
+            float pendingCatchLength = 0f;
 
             for (int i = 0; i < SlideCount; i++)
             {
                 var slideRng = new System.Random(rng.Next());
                 var enclosure = PickEnclosure(slideRng, i);
 
-                var loopKind = PickLoopKind(slideRng, i);
-                // A vertical loop goes upside-down, so it must be a closed tube.
-                if (loopKind == SlideLoopKind.Vertical)
+                var loopKinds = PickLoops(slideRng, i);
+                bool hasVerticalLoop = loopKinds != null && loopKinds.Contains(SlideLoopKind.Vertical);
+                // A vertical loop goes upside-down, so the slide must be a closed tube.
+                if (hasVerticalLoop)
                     enclosure = SlideEnclosure.Closed;
 
                 var openShape = enclosure == SlideEnclosure.Open ? PickOpenShape(slideRng) : OpenFlumeShape.Square;
@@ -355,7 +433,84 @@ namespace WaterSlides
                 slideGo.transform.SetPositionAndRotation(Vector3.zero, Quaternion.identity);
 
                 float loopRadius = LoopRadius.Sample(slideRng);
-                var generatedPath = BuildSlidePathWorld(slideRng, enclosure, cursorPos, worldEntry, i > 0, loopKind, loopRadius);
+
+                // The jump to the NEXT slide is decided BEFORE building this one: the
+                // "match" exit style needs the launch angle, and the landing placement
+                // below then reuses these exact values.
+                //
+                // The landing is placed ON the flight arc computed for AssumedExitSpeed
+                // under the player's REAL gravity. The old geometric rule (drop = 60% of
+                // the gap) needed a near-cap, no-braking exit for the longest jumps —
+                // slower exits (normal after braking through a turn) fell short into the
+                // void. Now a slow exit still reaches the entry, and a fast one simply
+                // overflies it and lands a bit further along the slide.
+                bool hasNextJump = i < SlideCount - 1;
+                float jumpGap = 0f, jumpStep = 0f;
+                Vector3 jumpOffsetXZ = Vector3.zero;
+
+                // Exit style: up (ski jump), down along the launch (match), or straight.
+                float kickAngle = 0f, kickLength = 0f;
+                double styleRoll = slideRng.NextDouble();
+                bool kickUp = styleRoll < ExitKickChance;
+                bool kickMatch = !kickUp && hasNextJump && styleRoll < ExitKickChance + ExitMatchChance;
+                if (kickUp)
+                {
+                    kickAngle = ExitKickAngle.Sample(slideRng);
+                    kickLength = ExitKickLength.Sample(slideRng);
+                }
+
+                if (hasNextJump)
+                {
+                    jumpGap = Mathf.Max(JumpGap.Sample(slideRng), 1f);
+                    jumpOffsetXZ = new Vector3(JumpOffsetX.Sample(slideRng), 0f, JumpOffsetZ.Sample(slideRng));
+
+                    // The offset direction relative to the exit heading is unknown until
+                    // the slide is built, so budget for the worst case (offset fully
+                    // co-directional) — overestimating the distance only lowers the
+                    // entry, which is the safe direction.
+                    float offsetMag = new Vector2(jumpOffsetXZ.x, jumpOffsetXZ.z).magnitude;
+                    float distance = jumpGap + offsetMag;
+
+                    float gravity = PlayerGravity();
+                    float speed = Mathf.Max(AssumedExitSpeed, 3f);
+
+                    // Assumed launch angle for the reachability calc. An up-kick only adds
+                    // range, so it safely counts as horizontal; straight ends usually
+                    // leave slightly nose-down, hence the 8°. The safety margin covers
+                    // steeper-than-assumed exits and the frame of the entry itself.
+                    const float safety = 1.15f;
+                    float launchDown = kickUp ? 0f : 8f;
+                    if (kickMatch)
+                    {
+                        // The match style bends the lip DOWN along the launch; the bend
+                        // steepens the fall, so its angle feeds back into the drop. One
+                        // provisional pass fixes the angle (capped: aiming straight at a
+                        // deep entry would turn the exit into a cliff dive).
+                        float provisionalDrop = BallisticDropAt(distance, speed, 8f, gravity) * safety;
+                        launchDown = Mathf.Min(Mathf.Atan2(provisionalDrop, distance) * Mathf.Rad2Deg, 25f);
+                    }
+
+                    jumpStep = BallisticDropAt(distance, speed, launchDown, gravity) * safety;
+                    if (jumpStep > MaxJumpDrop)
+                    {
+                        // Too deep — keep the drop and shorten the jump instead, so the
+                        // entry stays on the assumed-speed arc.
+                        float maxDistance = BallisticDistanceAt(MaxJumpDrop / safety, speed, launchDown, gravity);
+                        jumpGap = Mathf.Max(maxDistance - offsetMag, 1.5f);
+                        jumpStep = MaxJumpDrop;
+                    }
+                    jumpStep = Mathf.Max(jumpStep, Mathf.Min(MinJumpDrop, MaxJumpDrop));
+
+                    if (kickMatch)
+                    {
+                        kickAngle = -launchDown;
+                        kickLength = ExitKickLength.Sample(slideRng);
+                    }
+                }
+
+                var generatedPath = BuildSlidePathWorld(
+                    slideRng, enclosure, cursorPos, worldEntry, i > 0, loopKinds, loopRadius, kickAngle, kickLength,
+                    i > 0 ? pendingCatchLength : 0f);
 
                 var slide = slideGo.AddComponent<WaterSlideGenerator>();
                 ApplyRandomSlideSettings(slide, enclosure, slideRng);
@@ -363,10 +518,9 @@ namespace WaterSlides
                 slide.OpenShape = openShape;
                 slide.SlideColor = PickSlideColorStable(enclosure, openShape, slideRng);
                 slide.GenerateCollider = GenerateColliders;
-                slide.PreserveVerticalMotion = loopKind == SlideLoopKind.Vertical;
+                // The upward lip must survive the mesh builder's descent clamps too.
+                slide.PreserveVerticalMotion = hasVerticalLoop || kickAngle > 0.5f;
                 slide.HasLoop = generatedPath.HasLoop;
-                slide.LoopPathStart = generatedPath.LoopPathStart;
-                slide.LoopPathEnd = generatedPath.LoopPathEnd;
                 if (generatedPath.HasLoop)
                     slide.BankStrength = 0f;
 
@@ -389,15 +543,12 @@ namespace WaterSlides
                         heading = Vector3.forward;
                     heading.Normalize();
 
-                    // Jump forward along the exit heading, and ALWAYS step down a clear amount,
-                    // so the next entrance sits below the previous exit (you fly DOWN into it).
-                    float gap = Mathf.Max(JumpGap.Sample(slideRng), 1f);
-                    float step = Mathf.Max(JumpDrop.Sample(slideRng), gap * 0.6f);
-
-                    // Lateral offset of the next tube along world X / Z (configurable in inspector).
-                    Vector3 offsetXZ = new Vector3(JumpOffsetX.Sample(slideRng), 0f, JumpOffsetZ.Sample(slideRng));
-
-                    Vector3 landing = worldEnd + heading * gap + offsetXZ + Vector3.down * step;
+                    // Jump forward along the exit heading and down by the BALLISTIC drop
+                    // computed above for AssumedExitSpeed — the entry sits on (or slightly
+                    // below) the assumed flight arc. The values were pre-sampled before
+                    // building this slide — the "match" exit style bent the lip to
+                    // exactly this launch angle.
+                    Vector3 landing = worldEnd + heading * jumpGap + jumpOffsetXZ + Vector3.down * jumpStep;
 
                     // Entry aims along the actual jump chord, so it stays codirectional with the flight.
                     pendingEntryDir = (landing - worldEnd).normalized;
@@ -409,7 +560,19 @@ namespace WaterSlides
                         pendingEntryDir = (chordHoriz.normalized + Vector3.down * 0.5f).normalized;
                     }
 
-                    cursorPos = landing;
+                    // CATCH RAMP: start the next slide UP the jump chord, not at the landing
+                    // point itself. The landing sits on the arc for AssumedExitSpeed; a SLOWER
+                    // real exit (braked through a corner) flies a steeper arc that passes BELOW
+                    // that point — and the ride collider is the inner surface only (one-sided),
+                    // so a body arriving from outside sailed straight through the slide
+                    // ("пролетает сквозь горку"). A slow arc crosses the chord line upstream of
+                    // the landing (at ~40-60% of the gap for exits down to ~8 m/s), so extending
+                    // the entry flume up the chord catches those arcs from the INSIDE. Fast
+                    // exits are unaffected — their flatter arcs still overfly the entry and land
+                    // further along the slide, as before.
+                    float catchLength = Mathf.Clamp(jumpGap * 0.6f, 3f, 12f);
+                    pendingCatchLength = catchLength;
+                    cursorPos = landing - pendingEntryDir * catchLength;
                 }
             }
         }
@@ -519,9 +682,14 @@ namespace WaterSlides
             Vector3 worldStart,
             Vector3 worldEntry,
             bool isChainedSlide,
-            SlideLoopKind loopKind,
-            float loopRadius)
+            List<SlideLoopKind> loopKinds,
+            float loopRadius,
+            float exitKickAngle,
+            float exitKickLength,
+            float entryCatchLength = 0f)
         {
+            GetPlayerCornering(out float grip, out float brake, out float speedCap);
+
             var settings = new WaterSlidePathSettings
             {
                 TargetLength = SlideLength.Sample(rng),
@@ -532,37 +700,65 @@ namespace WaterSlides
                 MaxFeatures = FeaturesPerSlide.Max,
                 AllowLoops = AllowLoopsAndSpirals && enclosure == SlideEnclosure.Closed,
                 Enclosure = enclosure,
+                // Chained: the short post-jump run PLUS the catch-ramp extension — the slide
+                // was started up the jump chord by exactly that much (see Build), so the ramp
+                // runs along the chord through the nominal landing point and beyond.
                 InitialLaunchLength = isChainedSlide
-                    ? Mathf.Clamp(StartLaunchLength.Sample(rng) * ChainedRampScale, 1.5f, 3.5f)
+                    ? Mathf.Clamp(StartLaunchLength.Sample(rng) * ChainedRampScale, 1.5f, 3.5f) + entryCatchLength
                     : StartLaunchLength.Sample(rng),
                 AllowEntryRamp = true,
                 AscendingStart = !isChainedSlide,
-                LoopKind = loopKind,
+                Loops = loopKinds,
                 LoopRadius = loopRadius,
-                WorldStart = worldStart,
-                WorldStartForward = worldEntry,
-                UseWorldSpace = true
+                ExitKickAngle = exitKickAngle,
+                ExitKickLength = exitKickLength,
+                // Speed-aware corner fairness: real player physics plus the entry speed —
+                // a chained slide is entered at roughly the jump's exit speed, the first
+                // slide from a slow standing start.
+                RideSpeedCap = speedCap,
+                CorneringGrip = grip,
+                BrakeDeceleration = brake,
+                GravityAccel = PlayerGravity(),
+                EntrySpeed = isChainedSlide
+                    ? Mathf.Min(Mathf.Max(AssumedExitSpeed, 3f) * 1.05f, speedCap)
+                    : 4f
             };
 
             return WaterSlidePathGenerator.GenerateInWorldSpace(rng, settings, worldStart, worldEntry);
         }
 
-        SlideLoopKind PickLoopKind(System.Random rng, int index)
+        // The list of loops for one slide, in ride order (null — no loops). Kinds may
+        // repeat, so a slide can get several identical loops one after another.
+        List<SlideLoopKind> PickLoops(System.Random rng, int index)
         {
             if (!EnableLoops || index == 0)
-                return SlideLoopKind.None;
+                return null;
             if (rng.NextDouble() >= LoopChancePerSlide)
-                return SlideLoopKind.None;
+                return null;
 
-            bool canVertical = AllowVerticalLoops;
+            // A vertical loop forces the slide to become a closed tube (it goes upside-down),
+            // so it must not be picked when closed tubes are disabled.
+            bool canVertical = AllowVerticalLoops && AllowClosedTubes;
             bool canHorizontal = AllowHorizontalLoops;
-            if (canVertical && canHorizontal)
-                return rng.NextDouble() < 0.5 ? SlideLoopKind.Vertical : SlideLoopKind.Horizontal;
-            if (canVertical)
-                return SlideLoopKind.Vertical;
-            if (canHorizontal)
-                return SlideLoopKind.Horizontal;
-            return SlideLoopKind.None;
+            if (!canVertical && !canHorizontal)
+                return null;
+
+            int count = LoopsPerSlide.Sample(rng);
+            if (count <= 0)
+                return null;
+
+            var loops = new List<SlideLoopKind>(count);
+            for (int k = 0; k < count; k++)
+            {
+                SlideLoopKind kind;
+                if (canVertical && canHorizontal)
+                    kind = rng.NextDouble() < 0.5 ? SlideLoopKind.Vertical : SlideLoopKind.Horizontal;
+                else
+                    kind = canVertical ? SlideLoopKind.Vertical : SlideLoopKind.Horizontal;
+                loops.Add(kind);
+            }
+
+            return loops;
         }
 
         static string BuildSlideName(int index, SlideEnclosure enclosure, OpenFlumeShape shape)
@@ -604,7 +800,7 @@ namespace WaterSlides
             if (index == 0)
                 return SlideEnclosure.Open;
 
-            if (!MixOpenAndClosed)
+            if (!AllowClosedTubes)
                 return SlideEnclosure.Open;
 
             return rng.NextDouble() < ClosedSlideChance

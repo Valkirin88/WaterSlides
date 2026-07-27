@@ -6,7 +6,9 @@ namespace WaterSlides
     [Serializable]
     public struct FloatRange
     {
+        [Tooltip("Нижняя граница диапазона. Случайное значение берётся равномерно между Min и Max.")]
         public float Min;
+        [Tooltip("Верхняя граница диапазона. Случайное значение берётся равномерно между Min и Max.")]
         public float Max;
 
         public float Sample(System.Random rng)
@@ -20,7 +22,9 @@ namespace WaterSlides
     [Serializable]
     public struct IntRange
     {
+        [Tooltip("Нижняя граница целочисленного диапазона (включительно). Случайное значение берётся между Min и Max.")]
         public int Min;
+        [Tooltip("Верхняя граница целочисленного диапазона (включительно). Случайное значение берётся между Min и Max.")]
         public int Max;
 
         public int Sample(System.Random rng)

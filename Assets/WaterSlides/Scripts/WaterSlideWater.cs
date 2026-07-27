@@ -80,17 +80,6 @@ namespace WaterSlides
 
         const float DefaultSuimonoTransRenderDistance = 8f;
 
-        [Header("Diagnostics")]
-        [Tooltip("Дамп состояния воды в консоль через 1 и 6 секунд после старта игры (диагностика невидимой воды).")]
-        public bool LogWaterDiagnostics = true;
-
-        [Tooltip("Отладка: подменить материал воды на ярко-розовый Unlit прямо в игре. Если розовая лента видна в Game-виде — меш/камера/слои в порядке и проблема в шейдере Suimono; если нет — в геометрии.")]
-        public bool DebugUnlitWater;
-
-        int _diagnosticsShots;
-        Material _debugUnlitMaterial;
-        Material _suimonoMaterialBackup;
-
         GameObject _surfaceRoot;
         SuimonoObject _suimonoObject;
         Mesh _waterMesh;
@@ -239,6 +228,26 @@ namespace WaterSlides
                 ? preset.SuimonoTransRenderDistance
                 : DefaultSuimonoTransRenderDistance;
             module.transRenderDistance = Mathf.Clamp(transDistance, 3f, 50f);
+
+            DisableScreenRenderingHelperCameras(module);
+        }
+
+        // A Suimono helper camera (cam_SuimonoCaustic etc.) saved into the scene ENABLED and
+        // with no target texture renders the whole scene to the SCREEN each frame, on top of
+        // the main camera (its depth is higher) — and its culling mask excludes the Suimono
+        // water layers. Result: the Game view looks completely normal except the water is
+        // missing, while the Scene view (own camera) still shows it. These cameras are meant
+        // to be disabled components rendered manually into RenderTextures.
+        static void DisableScreenRenderingHelperCameras(SuimonoModule module)
+        {
+            foreach (var cam in module.GetComponentsInChildren<Camera>(true))
+            {
+                if (cam == null || cam.CompareTag("MainCamera"))
+                    continue;
+
+                if (cam.enabled && cam.targetTexture == null)
+                    cam.enabled = false;
+            }
         }
 
         public static void BindModuleCamera(SuimonoModule module)
@@ -420,6 +429,13 @@ namespace WaterSlides
         // rewrites waveScale, waveHeight, flowSpeed, flowDirection from the preset file).
         void ApplyDynamicSuimonoSettings()
         {
+            // Planar reflections run a live camera per surface that re-renders the WHOLE
+            // scene every frame — six slides meant six extra full-scene renders, the
+            // single biggest performance cost of the water. On a thin flowing ribbon the
+            // reflection is invisible anyway.
+            _suimonoObject.enableReflections = false;
+            _suimonoObject.enableDynamicReflections = false;
+
             _suimonoObject.typeIndex = 1;
             _suimonoObject.customWaves = true;
             _suimonoObject.useBeaufortScale = false;
@@ -452,15 +468,6 @@ namespace WaterSlides
 
         void LateUpdate()
         {
-            // Two snapshots: right after spawn and once Suimono has fully initialized —
-            // the state often differs and the second shot shows what stomped the first.
-            if (Application.isPlaying && IsSlideWater && LogWaterDiagnostics && _diagnosticsShots < 2
-                && Time.timeSinceLevelLoad > (_diagnosticsShots == 0 ? 1f : 6f))
-            {
-                _diagnosticsShots++;
-                DumpWaterDiagnostics();
-            }
-
             if (_suimonoObject == null || !EnableWater)
                 return;
 
@@ -507,79 +514,12 @@ namespace WaterSlides
             if (cam != null && (cam.cullingMask & (1 << suimonoObj.gameObject.layer)) == 0)
                 cam.cullingMask |= 1 << suimonoObj.gameObject.layer;
 
-            if (ApplyDebugUnlitMaterial(renderer))
-                return;
-
             var material = renderer.sharedMaterial;
             if (material == null)
                 return;
 
             material.SetFloat("suimono_trans_on", 0f);
             material.DisableKeyword("SUIMONO_TRANS_ON");
-        }
-
-        // Splits the "invisible water" search space in one run: an Unlit ribbon that DOES
-        // show up proves mesh/layer/camera are fine and the Suimono shader eats the pixels.
-        bool ApplyDebugUnlitMaterial(Renderer renderer)
-        {
-            if (DebugUnlitWater)
-            {
-                if (_debugUnlitMaterial == null)
-                {
-                    var unlit = Shader.Find("Unlit/Color");
-                    if (unlit == null)
-                        return false;
-                    _debugUnlitMaterial = new Material(unlit) { color = new Color(1f, 0f, 0.85f, 1f) };
-                }
-
-                if (renderer.sharedMaterial != _debugUnlitMaterial)
-                {
-                    _suimonoMaterialBackup = renderer.sharedMaterial;
-                    renderer.sharedMaterial = _debugUnlitMaterial;
-                }
-
-                return true;
-            }
-
-            if (_suimonoMaterialBackup != null && renderer.sharedMaterial == _debugUnlitMaterial)
-            {
-                renderer.sharedMaterial = _suimonoMaterialBackup;
-                _suimonoMaterialBackup = null;
-            }
-
-            return false;
-        }
-
-        // One-shot state dump for the "water invisible in Game view" class of bugs: every
-        // fact needed to tell apart layer/culling, material, mesh and module problems.
-        void DumpWaterDiagnostics()
-        {
-            var cam = Camera.main;
-            var suimonoObj = _surfaceRoot != null ? _surfaceRoot.transform.Find("Suimono_Object") : null;
-            var renderer = suimonoObj != null ? suimonoObj.GetComponent<Renderer>() : null;
-            var material = renderer != null ? renderer.sharedMaterial : null;
-            var module = FindAnyObjectByType<SuimonoModule>();
-
-            string rendInfo = renderer == null
-                ? "renderer=NULL"
-                : $"rendEnabled={renderer.enabled} isVisible={renderer.isVisible} layer={LayerMask.LayerToName(renderer.gameObject.layer)} bounds={renderer.bounds.center:F1}/{renderer.bounds.size:F1}";
-            string matInfo = material == null
-                ? "mat=NULL"
-                : $"shader={material.shader.name} queue={material.renderQueue} transOn={(material.HasProperty("suimono_trans_on") ? material.GetFloat("suimono_trans_on").ToString("F0") : "—")}";
-            string camInfo = cam == null
-                ? "cam=NULL"
-                : $"cam={cam.name} pos={cam.transform.position:F1} far={cam.farClipPlane} maskHasLayer={(renderer != null ? ((cam.cullingMask & (1 << renderer.gameObject.layer)) != 0).ToString() : "—")} depthMode={cam.depthTextureMode}";
-            string meshInfo = _waterMesh == null ? "mesh=NULL" : $"meshVerts={_waterMesh.vertexCount}";
-            string moduleInfo = module == null
-                ? "module=NULL"
-                : $"moduleTrans={module.enableTransparency} moduleCam={(module.setCamera != null ? module.setCamera.name : "NULL")}";
-
-            var meshFilter = suimonoObj != null ? suimonoObj.GetComponent<MeshFilter>() : null;
-            string suimonoInfo = _suimonoObject == null
-                ? "suiObj=NULL"
-                : $"suiType={_suimonoObject.typeIndex} customMesh={_suimonoObject.enableCustomMesh}/{(_suimonoObject.customMesh != null ? _suimonoObject.customMesh.vertexCount.ToString() : "NULL")} filterMesh={(meshFilter != null && meshFilter.sharedMesh != null ? meshFilter.sharedMesh.vertexCount.ToString() : "NULL")}";
-
-            Debug.Log($"[WaterDiag {name} t={Time.timeSinceLevelLoad:F1}] enableWater={EnableWater} rootActive={(_surfaceRoot != null ? _surfaceRoot.activeInHierarchy.ToString() : "NULL")} | {rendInfo} | {matInfo} | {meshInfo} | {suimonoInfo} | {camInfo} | {moduleInfo}", this);
         }
 
         void ApplyMeshToSuimonoRenderer()
@@ -591,13 +531,20 @@ namespace WaterSlides
             if (suimonoObj == null)
                 return;
 
+            // Guarded assignment: this runs every LateUpdate, and re-assigning a
+            // MeshCollider/MeshFilter mesh each frame re-cooks it (heavy on every slide).
             var meshFilter = suimonoObj.GetComponent<MeshFilter>();
-            if (meshFilter != null)
-                meshFilter.mesh = _waterMesh;
+            if (meshFilter != null && meshFilter.sharedMesh != _waterMesh)
+                meshFilter.sharedMesh = _waterMesh;
 
+            // Slide water is a visual ribbon INSIDE the ride channel: with its collider
+            // solid, the ribbon cuts through the rider's capsule and the depenetration
+            // kicks the body every step (jitter, escapes through tube walls, solver load).
+            // Suimono only needs this collider for interaction queries, which are disabled
+            // on slides.
             var meshCollider = suimonoObj.GetComponent<MeshCollider>();
-            if (meshCollider != null)
-                meshCollider.sharedMesh = _waterMesh;
+            if (meshCollider != null && meshCollider.enabled)
+                meshCollider.enabled = false;
         }
 
         IEnumerator RefreshSuimonoWhenReady()

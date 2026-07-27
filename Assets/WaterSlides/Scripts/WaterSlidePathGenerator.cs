@@ -13,7 +13,6 @@ namespace WaterSlides
         Corkscrew,
         Helix,
         BowlTurn,
-        Zigzag,
         Drop
     }
 
@@ -37,20 +36,37 @@ namespace WaterSlides
         public float InitialLaunchLength;
         public bool AllowEntryRamp;
         public bool AscendingStart;
-        public SlideLoopKind LoopKind;
+
+        // Loops to insert along the slide, in ride order. Kinds may repeat, and several
+        // loops may land on the same slot — then they run back-to-back.
+        public List<SlideLoopKind> Loops;
         public float LoopRadius;
-        public Vector3 WorldStart;
-        public Vector3 WorldStartForward;
-        public bool UseWorldSpace;
+
+        // Ski-jump lip at the slide end: the last metres bend upwards to this angle
+        // (degrees; 0 = flat exit) while keeping the horizontal heading.
+        public float ExitKickAngle;
+        public float ExitKickLength;
+
+        // Speed-aware corner fairness (open flumes). The player's cornering physics, in
+        // the same units PlayerView uses: a corner of radius R is only holdable below
+        // √(grip·R), so the generator tracks an estimated ride speed along the path and
+        // widens turns / inserts braking straights so that "steep drop → immediate sharp
+        // turn" never produces a GUARANTEED flyout. Zeros fall back to sane defaults.
+        public float RideSpeedCap;      // потолок скорости езды, м/с
+        public float CorneringGrip;     // сцепление в поворотах, м/с²
+        public float BrakeDeceleration; // торможение игрока (S), м/с²
+        public float GravityAccel;      // эффективная гравитация игрока, м/с²
+        public float EntrySpeed;        // расчётная скорость на входе в горку, м/с
     }
 
     public struct GeneratedSlidePath
     {
         public List<Vector3> Points;
-        public int LoopPathStart;
-        public int LoopPathEnd;
 
-        public bool HasLoop => LoopPathStart >= 0 && LoopPathEnd > LoopPathStart;
+        // Index ranges of the path occupied by loops (protected from smoothing/decimation).
+        public List<Vector2Int> LoopRanges;
+
+        public bool HasLoop => LoopRanges != null && LoopRanges.Count > 0;
     }
 
     public static class WaterSlidePathGenerator
@@ -59,17 +75,9 @@ namespace WaterSlides
         {
             public Vector3 Position;
             public Vector3 Forward;
-        }
-
-        public static List<Vector3> Generate(System.Random rng, WaterSlidePathSettings settings) =>
-            GeneratePath(rng, settings).Points;
-
-        public static GeneratedSlidePath GeneratePath(System.Random rng, WaterSlidePathSettings settings)
-        {
-            if (settings.UseWorldSpace)
-                return GenerateInWorldSpace(rng, settings, settings.WorldStart, settings.WorldStartForward);
-
-            return GenerateInWorldSpace(rng, settings, Vector3.zero, Vector3.forward);
+            // Estimated ride speed at this point (m/s) — energy model without friction
+            // (overestimates, which errs on the SAFE side: wider turns, longer braking).
+            public float Speed;
         }
 
         public static GeneratedSlidePath GenerateInWorldSpace(
@@ -78,12 +86,20 @@ namespace WaterSlides
             Vector3 worldStart,
             Vector3 worldStartForward)
         {
+            // Physics defaults matching PlayerView's script defaults, used when the
+            // caller does not supply real values (settings is a by-value copy).
+            if (settings.RideSpeedCap <= 0.1f) settings.RideSpeedCap = 16f;
+            if (settings.CorneringGrip <= 0.1f) settings.CorneringGrip = 20f;
+            if (settings.BrakeDeceleration <= 0.1f) settings.BrakeDeceleration = 12f;
+            if (settings.GravityAccel <= 0.1f) settings.GravityAccel = 17.6f;
+
             var points = new List<Vector3> { worldStart };
             var forward = worldStartForward.sqrMagnitude > 0.0001f ? worldStartForward.normalized : Vector3.forward;
             var state = new PathState
             {
                 Position = worldStart,
-                Forward = forward
+                Forward = forward,
+                Speed = Mathf.Clamp(settings.EntrySpeed, 0f, settings.RideSpeedCap)
             };
 
             int rampEndIndex = 0;
@@ -106,8 +122,11 @@ namespace WaterSlides
             float dropBudget = settings.TotalDrop;
             float lengthBudget = settings.TargetLength;
 
-            int loopAt = settings.LoopKind != SlideLoopKind.None ? Mathf.Max(features.Count / 2, 1) : -1;
-            int loopStart = -1, loopEnd = -1;
+            var loops = settings.Loops;
+            int loopCount = loops != null ? loops.Count : 0;
+            var loopRanges = new List<Vector2Int>();
+            bool anyVerticalLoop = false;
+            int nextLoop = 0;
 
             for (int i = 0; i < features.Count; i++)
             {
@@ -117,31 +136,39 @@ namespace WaterSlides
                     InsertBlendPoint(points, ref state);
                 AppendFeature(points, ref state, rng, features[i], settings, featureLength, featureDrop);
 
-                if (i == loopAt)
+                // Insert every loop assigned to this feature slot. Several loops may share
+                // a slot — they then run back-to-back, one straight into the next.
+                while (nextLoop < loopCount && LoopSlot(nextLoop, loopCount, features.Count) == i)
                 {
                     InsertBlendPoint(points, ref state);
-                    loopStart = points.Count;
-                    if (settings.LoopKind == SlideLoopKind.Vertical)
+                    int loopStart = points.Count;
+                    float loopStartY = state.Position.y;
+                    if (loops[nextLoop] == SlideLoopKind.Vertical)
                     {
+                        anyVerticalLoop = true;
                         AppendVerticalLoop(points, ref state, settings.LoopRadius, PickSign(rng), out var lateralDir);
                         AppendVerticalLoopExitRamp(points, ref state, settings.LoopRadius, lateralDir);
                     }
                     else
+                    {
                         AppendHorizontalLoop(points, ref state, settings.LoopRadius, settings.LoopRadius * 0.5f, PickSign(rng));
-                    loopEnd = points.Count - 1;
+                    }
+
+                    loopRanges.Add(new Vector2Int(loopStart, points.Count - 1));
+                    state.Speed = SpeedAfterDrop(state.Speed, loopStartY - state.Position.y, settings);
+                    nextLoop++;
                 }
             }
 
             AppendExitTangentSegment(points);
 
-            bool verticalLoop = settings.LoopKind == SlideLoopKind.Vertical;
-            SmoothCorners(points, iterations: verticalLoop ? 1 : 3, factor: 0.3f, protStart: loopStart, protEnd: loopEnd);
+            SmoothCorners(points, iterations: anyVerticalLoop ? 1 : 3, factor: 0.3f, loopRanges);
 
-            if (verticalLoop)
+            if (anyVerticalLoop)
             {
-                // Only push the run AFTER the loop downward, so the slide finishes below its
-                // start and clear of the loop, without flattening the loop itself.
-                DescendTailAfter(points, loopEnd, settings.TotalDrop * 0.5f);
+                // Only push the run AFTER the last loop downward, so the slide finishes below
+                // its start and clear of the loops, without flattening the loops themselves.
+                DescendTailAfter(points, loopRanges[^1].y, settings.TotalDrop * 0.5f);
             }
             else
             {
@@ -152,13 +179,64 @@ namespace WaterSlides
                 EnsureStartAboveEnd(points, settings.TotalDrop, rampEndIndex);
             }
 
-            RemoveNearDuplicates(points, 0.15f, ref loopStart, ref loopEnd);
+            // AFTER the descent enforcement: the "always down" clamps must never see an
+            // upward lip (such a slide must also carry PreserveVerticalMotion so the mesh
+            // builder's own clamps keep their hands off it too). Negative angles bend the
+            // lip DOWN — e.g. onto the jump chord towards the next slide's entrance.
+            if (Mathf.Abs(settings.ExitKickAngle) > 0.5f)
+                AppendExitKick(points, settings.ExitKickAngle, Mathf.Max(settings.ExitKickLength, 1f));
+
+            RemoveNearDuplicates(points, 0.15f, loopRanges);
             return new GeneratedSlidePath
             {
                 Points = points,
-                LoopPathStart = loopStart,
-                LoopPathEnd = loopEnd
+                LoopRanges = loopRanges
             };
+        }
+
+        // Ski-jump lip: bends the last metres upwards while keeping the horizontal
+        // heading, so the rider is thrown UP but still TOWARDS the next slide.
+        static void AppendExitKick(List<Vector3> points, float angleDegrees, float length)
+        {
+            if (points.Count < 2)
+                return;
+
+            var dir = points[^1] - points[^2];
+            var horiz = Vector3.ProjectOnPlane(dir, Vector3.up);
+            if (horiz.sqrMagnitude < 1e-4f)
+                return;
+            horiz.Normalize();
+
+            float startPitch = Mathf.Atan2(dir.y, new Vector2(dir.x, dir.z).magnitude);
+            float endPitch = angleDegrees * Mathf.Deg2Rad;
+
+            const int steps = 7;
+            float stepLength = length / steps;
+            Vector3 pos = points[^1];
+            for (int i = 1; i <= steps; i++)
+            {
+                // Ease-in: the ramp starts gently and tightens towards the lip.
+                float t = i / (float)steps;
+                float pitch = Mathf.Lerp(startPitch, endPitch, t * t);
+                pos += (horiz * Mathf.Cos(pitch) + Vector3.up * Mathf.Sin(pitch)) * stepLength;
+                points.Add(pos);
+            }
+        }
+
+        // Feature index after which the given loop is inserted: loops are spread evenly
+        // along the slide; rounding collisions put loops on the same slot (consecutively).
+        static int LoopSlot(int loopIndex, int loopCount, int featureCount) =>
+            Mathf.Clamp(Mathf.RoundToInt((loopIndex + 1) * featureCount / (loopCount + 1f)), 1, featureCount - 1);
+
+        static bool InAnyRange(List<Vector2Int> ranges, int index)
+        {
+            for (int i = 0; i < ranges.Count; i++)
+            {
+                if (index >= ranges[i].x && index <= ranges[i].y)
+                    return true;
+            }
+
+            return false;
         }
 
         // Lowers points after a given index along a ramp so the path ends clearly below its start.
@@ -186,7 +264,7 @@ namespace WaterSlides
 
         // Drops consecutive points that are almost coincident; near-duplicate knots make the
         // centripetal Catmull-Rom spline overshoot and the tube fold/break.
-        static void RemoveNearDuplicates(List<Vector3> points, float minSpacing, ref int protStart, ref int protEnd)
+        static void RemoveNearDuplicates(List<Vector3> points, float minSpacing, List<Vector2Int> protectedRanges)
         {
             if (points.Count < 3)
                 return;
@@ -194,20 +272,19 @@ namespace WaterSlides
             float sqr = minSpacing * minSpacing;
             for (int i = points.Count - 2; i >= 1; i--)
             {
-                if (protStart >= 0 && i >= protStart && i <= protEnd)
+                if (InAnyRange(protectedRanges, i))
                     continue;
 
                 if ((points[i] - points[i - 1]).sqrMagnitude < sqr)
                 {
                     points.RemoveAt(i);
-                    if (protStart >= 0 && i < protStart)
+                    for (int r = 0; r < protectedRanges.Count; r++)
                     {
-                        protStart--;
-                        protEnd--;
-                    }
-                    else if (protStart >= 0 && i <= protEnd)
-                    {
-                        protEnd--;
+                        var range = protectedRanges[r];
+                        if (i < range.x)
+                            protectedRanges[r] = new Vector2Int(range.x - 1, range.y - 1);
+                        else if (i <= range.y)
+                            protectedRanges[r] = new Vector2Int(range.x, range.y - 1);
                     }
                 }
             }
@@ -314,7 +391,7 @@ namespace WaterSlides
         }
 
         // Rounds every interior corner with a few Laplacian passes; endpoints and loop points stay fixed.
-        static void SmoothCorners(List<Vector3> points, int iterations, float factor, int protStart, int protEnd)
+        static void SmoothCorners(List<Vector3> points, int iterations, float factor, List<Vector2Int> protectedRanges)
         {
             if (points.Count < 3)
                 return;
@@ -324,7 +401,7 @@ namespace WaterSlides
                 var copy = new List<Vector3>(points);
                 for (int i = 1; i < points.Count - 1; i++)
                 {
-                    if (protStart >= 0 && i >= protStart && i <= protEnd)
+                    if (InAnyRange(protectedRanges, i))
                         continue;
                     var avg = (copy[i - 1] + copy[i + 1]) * 0.5f;
                     points[i] = Vector3.Lerp(copy[i], avg, factor);
@@ -493,32 +570,113 @@ namespace WaterSlides
             {
                 case SlidePathFeature.Straight:
                     AppendStraight(points, ref state, length * 0.6f, drop * 0.5f);
+                    state.Speed = SpeedAfterDrop(state.Speed, Mathf.Max(drop * 0.5f, length * 0.06f), settings);
                     break;
                 case SlidePathFeature.WideCurve:
-                    AppendArc(points, ref state, radius * 1.4f, PickSign(rng) * Mathf.PI * 0.45f, drop, 6);
+                {
+                    float r = EnsureCornerFair(points, ref state, settings, radius * 1.4f, drop);
+                    AppendArc(points, ref state, r, PickSign(rng) * Mathf.PI * 0.45f, drop, 6);
+                    FinishCorner(ref state, settings, r, drop);
                     break;
+                }
                 case SlidePathFeature.SharpTurn:
-                    AppendArc(points, ref state, radius * 0.75f, PickSign(rng) * Mathf.PI * 0.55f, drop, 5);
+                {
+                    float r = EnsureCornerFair(points, ref state, settings, radius * 0.75f, drop);
+                    AppendArc(points, ref state, r, PickSign(rng) * Mathf.PI * 0.55f, drop, 5);
+                    FinishCorner(ref state, settings, r, drop);
                     break;
+                }
                 case SlidePathFeature.SCurve:
-                    AppendSCurve(points, ref state, radius, drop, rng);
+                {
+                    // Both arcs of the S share the base radius (the second is ×1.1), so
+                    // fairness on the base covers the tighter of the two.
+                    float r = EnsureCornerFair(points, ref state, settings, radius, drop);
+                    AppendSCurve(points, ref state, r, drop, rng);
+                    FinishCorner(ref state, settings, r, drop);
                     break;
+                }
                 case SlidePathFeature.Corkscrew:
                     AppendCorkscrew(points, ref state, radius * 0.85f, 0.45f + (float)rng.NextDouble() * 0.35f, length, drop, 16);
+                    state.Speed = SpeedAfterDrop(state.Speed, drop, settings);
                     break;
                 case SlidePathFeature.Helix:
                     AppendCorkscrew(points, ref state, radius * 1.05f, 0.65f + (float)rng.NextDouble() * 0.45f, length * 1.05f, drop, 22);
+                    state.Speed = SpeedAfterDrop(state.Speed, drop, settings);
                     break;
                 case SlidePathFeature.BowlTurn:
-                    AppendBowlTurn(points, ref state, radius * 1.2f, PickSign(rng), drop, rng);
+                {
+                    float r = EnsureCornerFair(points, ref state, settings, radius * 1.2f, drop);
+                    AppendBowlTurn(points, ref state, r, PickSign(rng), drop, rng);
+                    FinishCorner(ref state, settings, r, drop);
                     break;
-                case SlidePathFeature.Zigzag:
-                    AppendZigzag(points, ref state, radius * 0.9f, drop, rng);
-                    break;
+                }
                 case SlidePathFeature.Drop:
                     AppendDrop(points, ref state, length * 0.45f, drop * 1.35f, rng);
+                    state.Speed = SpeedAfterDrop(state.Speed, drop * 1.35f, settings);
                     break;
             }
+        }
+
+        // Energy-model speed update over a descent (no friction — overestimates, i.e.
+        // errs towards wider turns and longer braking runs), capped by the ride ceiling.
+        static float SpeedAfterDrop(float speed, float drop, in WaterSlidePathSettings settings)
+        {
+            float v2 = speed * speed + 2f * settings.GravityAccel * Mathf.Max(drop, 0f);
+            return Mathf.Min(settings.RideSpeedCap, Mathf.Sqrt(Mathf.Max(v2, 0f)));
+        }
+
+        // Corner fairness for OPEN flumes (a closed tube holds the rider geometrically —
+        // untouched). The player holds a corner of radius R only below √(grip·R); after
+        // a steep drop the arrival speed exceeds that for any sharp radius, and since
+        // nothing between the drop and the turn allows braking, the flyout was
+        // GUARANTEED, not a skill fail. Returns the radius to actually build:
+        //  1) widen the turn up to the widest ordinary curve so the arrival speed fits;
+        //  2) if even that is not enough — insert a braking straight sized so the player
+        //     CAN slow down to the corner speed (12 m/s² braking), then keep the wide
+        //     radius. Flyouts remain possible for a player who does not brake — the
+        //     mechanic stays, only the impossible situations go away.
+        static float EnsureCornerFair(
+            List<Vector3> points,
+            ref PathState state,
+            in WaterSlidePathSettings settings,
+            float radius,
+            float drop)
+        {
+            if (settings.Enclosure != SlideEnclosure.Open)
+                return radius;
+
+            float grip = settings.CorneringGrip;
+            // The turn itself keeps descending and re-accelerating the rider, so judge
+            // fairness against the projected MID-turn speed, not just the entry speed.
+            float vMid = SpeedAfterDrop(state.Speed, Mathf.Max(drop, 0f) * 0.5f, settings);
+            float vAllowed = Mathf.Sqrt(grip * radius) * 0.95f;
+            if (vMid <= vAllowed)
+                return radius;
+
+            float radiusCap = Mathf.Max(settings.TurnRadiusMax * 1.4f, radius);
+            float radiusFit = vMid * vMid / (grip * 0.85f);
+            if (radiusFit <= radiusCap)
+                return Mathf.Max(radius, radiusFit);
+
+            radius = radiusCap;
+            vAllowed = Mathf.Sqrt(grip * radius) * 0.95f;
+            float brakeLength = (vMid * vMid - vAllowed * vAllowed) / (2f * settings.BrakeDeceleration);
+            brakeLength = Mathf.Clamp(brakeLength * 1.2f + 2f, 3f, 30f);
+            // Gentle slope on the braking run: it must keep descending (the monotonic
+            // clamp would bend it anyway) without feeding much speed back.
+            AppendStraight(points, ref state, brakeLength, brakeLength * 0.08f);
+            state.Speed = Mathf.Min(state.Speed, vAllowed);
+            return radius;
+        }
+
+        // After the turn: cornering forces shed everything above the holdable speed
+        // (the attentive player braked to make it), then the turn's own descent
+        // re-accelerates as usual.
+        static void FinishCorner(ref PathState state, in WaterSlidePathSettings settings, float radius, float drop)
+        {
+            if (settings.Enclosure == SlideEnclosure.Open)
+                state.Speed = Mathf.Min(state.Speed, Mathf.Sqrt(settings.CorneringGrip * radius) * 0.95f);
+            state.Speed = SpeedAfterDrop(state.Speed, Mathf.Max(drop, 0f), settings);
         }
 
         static void InsertBlendPoint(List<Vector3> points, ref PathState state)
@@ -628,21 +786,6 @@ namespace WaterSlides
         {
             float sweep = Mathf.Lerp(Mathf.PI * 0.35f, Mathf.PI * 0.75f, (float)rng.NextDouble());
             AppendArc(points, ref state, radius, sign * sweep, drop, 10);
-        }
-
-        static void AppendZigzag(List<Vector3> points, ref PathState state, float radius, float drop, System.Random rng)
-        {
-            int legs = 3 + rng.Next(2);
-            float turnSign = PickSign(rng);
-            float dropPerLeg = drop / legs;
-            float legAngle = Mathf.PI * 0.34f;
-
-            for (int leg = 0; leg < legs; leg++)
-            {
-                AppendArc(points, ref state, radius, turnSign * legAngle, dropPerLeg, 4);
-                AppendStraight(points, ref state, radius * 0.45f, dropPerLeg * 0.12f);
-                turnSign *= -1f;
-            }
         }
 
         static void AppendDrop(
