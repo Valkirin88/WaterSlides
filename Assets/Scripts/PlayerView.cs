@@ -72,6 +72,8 @@ public class PlayerView : MonoBehaviour
     [SerializeField] float _captureEaseTime = 0.8f;
     [Tooltip("Приземление на горку после полёта: в момент касания вектор скорости МГНОВЕННО задаётся вдоль горки (вниз по пути), величина скорости сохраняется полностью — весь запас хода переходит в езду. Выкл — скорость доворачивается постепенно (сцепление, рампа захвата и окно ловли поперечного приземления ниже).")]
     [SerializeField] bool _landingAlignVelocity = true;
+    [Tooltip("Потолок скорости езды, которую задаёт снап приземления, м/с. При падении с большой высоты величина скорости огромна; без потолка она целиком переходила в ход вдоль горки — на первом же изгибе тело отрывалось от поверхности и вылетало (читалось как отскок). Излишек сверх потолка гасится ударом о воду. Если максимальная скорость на горке выше потолка — действует она. 0 — без потолка (прежнее поведение).")]
+    [SerializeField] float _landingSnapSpeedCap = 18f;
     [Tooltip("Ловля ПОПЕРЕЧНОГО приземления: если после настоящего полёта скорость пришла к горке под углом к направлению пути больше этого порога (градусы, угол меряется в плоскости жёлоба), открывается окно быстрого доворота — ТЕЛО разворачивается вдоль горки на полной скорости выравнивания (а при выключенном мгновенном снапе выше — и скорость, со скоростью ниже). 0 — отключить.")]
     [SerializeField] float _crossLandingAngle = 40f;
     [Tooltip("Скорость доворота СКОРОСТИ вдоль пути в окне ловли, рад/с — используется, когда мгновенный снап скорости при приземлении выключен. Работает МИМО потолка сцепления и рампы захвата. Скорость при развороте не режется — только поворачивается.")]
@@ -455,17 +457,15 @@ public class PlayerView : MonoBehaviour
         // A deliberate jump suppresses guidance and is never flattened.
         else if (_landingNoBounceTimer > 0f && _guideSuppressTimer <= 0f)
         {
-            Vector3 contactNormal = _slideNormalTarget;
-            float outward = Vector3.Dot(vel, contactNormal);
-            if (outward > 1e-3f)
-            {
-                Vector3 flat = vel - contactNormal * outward;
-                if (flat.sqrMagnitude > 1e-4f)
-                {
-                    vel = flat.normalized * vel.magnitude;
-                    _rigidbody.linearVelocity = vel;
-                }
-            }
+            // Checked against BOTH normals: the raw contact normal (the honest local
+            // facet), and the smoothed one — a high-speed impact on a triangle edge
+            // reports a junk contact normal, the solver kick along it reads as flat to
+            // that junk plane and escaped the raw check, while the smoothed normal
+            // barely follows one-frame junk and still sees the velocity as outward.
+            bool changed = FlattenOutward(ref vel, _slideNormalTarget);
+            changed |= FlattenOutward(ref vel, _slideNormal);
+            if (changed)
+                _rigidbody.linearVelocity = vel;
         }
 
         float speed = vel.magnitude;
@@ -501,6 +501,22 @@ public class PlayerView : MonoBehaviour
             // ease instead of being cut the moment the body touches the next slide.
             _rigidbody.linearVelocity = vel * Mathf.Lerp(1f, _maxSlideSpeed / speed, AssistWeight);
         }
+    }
+
+    // Rotates the velocity component pointing OUT along the normal back into the
+    // surface plane, keeping the magnitude — the kick becomes ride speed, not a hop.
+    static bool FlattenOutward(ref Vector3 vel, Vector3 normal)
+    {
+        float outward = Vector3.Dot(vel, normal);
+        if (outward <= 1e-3f)
+            return false;
+
+        Vector3 flat = vel - normal * outward;
+        if (flat.sqrMagnitude <= 1e-4f)
+            return false;
+
+        vel = flat.normalized * vel.magnitude;
+        return true;
     }
 
     // 0 → 1 over _captureEaseTime after a fresh landing: every path-assist force is
@@ -616,8 +632,21 @@ public class PlayerView : MonoBehaviour
             // velocity with an off-surface component reads as a bounce at touchdown.
             if (_landingAlignVelocity && speed > 1f)
             {
+                // A big-height fall arrives far above the ride cap; transferring the
+                // whole magnitude into ride speed threw the body off the first convex
+                // bend (the surface drops away faster than gravity can bend a 30+ m/s
+                // trajectory) — read as a bounce. The excess dies in the splash.
+                if (_landingSnapSpeedCap > 0f)
+                    speed = Mathf.Min(speed, Mathf.Max(_landingSnapSpeedCap, _maxSlideSpeed));
                 Vector3 rideDir = Vector3.ProjectOnPlane(tangent, _slideNormalTarget);
                 rideDir = rideDir.sqrMagnitude > 1e-4f ? rideDir.normalized : tangent;
+                // A hard, fast impact often lands on a triangle EDGE and the reported
+                // contact normal is junk (tilted far off the surface); projecting into
+                // that plane aimed the snapped velocity ABOVE the slide — an instant
+                // launch. A normal facet only bends the tangent a few degrees, so a
+                // large bend means a junk normal: ride along the raw tangent instead.
+                if (Vector3.Angle(rideDir, tangent) > 25f)
+                    rideDir = tangent;
                 vel = rideDir * speed;
             }
         }
@@ -678,6 +707,20 @@ public class PlayerView : MonoBehaviour
 
         if (slide.Enclosure == SlideEnclosure.Open)
         {
+            // Rim landing whose contact still classified as INNER (the lip normal can
+            // tip either way): same rescue as the collision-side catch — while the
+            // landing window is open, a body over the wall band is put back inside the
+            // channel instead of toppling off the outer side.
+            if (_landingNoBounceTimer > 0f && Mathf.Abs(lateral) > usableHalf + bodyRadius * 0.5f)
+            {
+                float side = Mathf.Sign(lateral);
+                _rigidbody.position += right * (side * usableHalf - lateral);
+                lateral = side * usableHalf;
+                float outwardVel = Vector3.Dot(vel, right) * side;
+                if (outwardVel > 0f)
+                    vel -= right * (side * outwardVel);
+            }
+
             // Soft feel-assists only: damp the side-to-side oscillation and drift back
             // towards the centreline while inside the channel. The walls hold the body
             // geometrically, and enough speed legitimately climbs and clears them.
@@ -997,7 +1040,8 @@ public class PlayerView : MonoBehaviour
 
     void AlignBodyToContacts()
     {
-        if (_rigidbody == null)
+        // Kinematic during the spawn window — velocity writes would warn.
+        if (_rigidbody == null || _rigidbody.isKinematic)
             return;
 
         // A short grace after losing contact: a hop over a seam must not flip the body
@@ -1019,7 +1063,10 @@ public class PlayerView : MonoBehaviour
             if (forward.sqrMagnitude < 0.25f)
                 forward = Vector3.ProjectOnPlane(transform.forward, normal);
             if (forward.sqrMagnitude < 1e-6f)
+            {
+                _rigidbody.angularVelocity = Vector3.zero;
                 return;
+            }
 
             forward.Normalize();
             var target = Quaternion.LookRotation(forward, normal);
@@ -1031,18 +1078,24 @@ public class PlayerView : MonoBehaviour
             float align = _slideAlignSpeed * (_crossLandingTimer > 0f
                 ? 1f
                 : Mathf.Lerp(0.35f, 1f, AssistWeight));
-            _rigidbody.MoveRotation(Quaternion.Slerp(_rigidbody.rotation, target, align * Time.fixedDeltaTime));
+            SteerRotationTowards(Quaternion.Slerp(_rigidbody.rotation, target, align * Time.fixedDeltaTime));
             return;
         }
 
         // Initial drop onto the first slide: keep the spawn orientation (nose along the
         // slide) so the body lands flat instead of pitching into the near-vertical velocity.
         if (!_hasSlideContactSinceSpawn)
+        {
+            _rigidbody.angularVelocity = Vector3.zero;
             return;
+        }
 
         Vector3 airVelocity = _rigidbody.linearVelocity;
         if (airVelocity.sqrMagnitude < 0.25f)
+        {
+            _rigidbody.angularVelocity = Vector3.zero;
             return;
+        }
 
         // The pitch is CLAMPED: following the full 3D velocity pointed the body nose-first
         // down the fall arc — any strafe or jump read as the player keeling over forward.
@@ -1063,7 +1116,29 @@ public class PlayerView : MonoBehaviour
         }
 
         var airTarget = Quaternion.Euler(pitch, yaw, 0f);
-        _rigidbody.MoveRotation(Quaternion.Slerp(_rigidbody.rotation, airTarget, _slideAlignSpeed * 0.5f * Time.fixedDeltaTime));
+        SteerRotationTowards(Quaternion.Slerp(_rigidbody.rotation, airTarget, _slideAlignSpeed * 0.5f * Time.fixedDeltaTime));
+    }
+
+    // The body rotation is driven by SETTING the angular velocity, never by
+    // MoveRotation: on a dynamic interpolated rigidbody MoveRotation is a teleport —
+    // the rotation stepped 50 times/s past the render interpolation, and the model
+    // visibly twitched whenever the target orientation changed fast (riding a
+    // changing slope, the pitch chasing the fall arc). Velocity-driven rotation is
+    // integrated by the simulation, so the render interpolates it like any physical
+    // motion. The value is overwritten every step, so control stays as absolute as
+    // the teleport was, and spin the contacts add within a step is discarded.
+    void SteerRotationTowards(Quaternion desired)
+    {
+        (desired * Quaternion.Inverse(_rigidbody.rotation)).ToAngleAxis(out float angle, out Vector3 axis);
+        if (angle > 180f)
+            angle -= 360f;
+        if (Mathf.Abs(angle) < 1e-3f || float.IsInfinity(axis.x) || axis.sqrMagnitude < 1e-8f)
+        {
+            _rigidbody.angularVelocity = Vector3.zero;
+            return;
+        }
+
+        _rigidbody.angularVelocity = axis.normalized * (angle * Mathf.Deg2Rad / Time.fixedDeltaTime);
     }
 
     // Direction with its vertical angle limited to ±maxPitchDegrees; the horizontal
@@ -1115,7 +1190,10 @@ public class PlayerView : MonoBehaviour
             return;
 
         if (!IsInnerSurfaceContact(slide, collision))
+        {
+            TryCatchRimLanding(slide);
             return;
+        }
 
         _slideContacts.Add(collision.collider);
         _hasSlideContactSinceSpawn = true;
@@ -1135,6 +1213,7 @@ public class PlayerView : MonoBehaviour
         if (!IsInnerSurfaceContact(slide, collision))
         {
             _slideContacts.Remove(collision.collider);
+            TryCatchRimLanding(slide);
             return;
         }
 
@@ -1154,6 +1233,55 @@ public class PlayerView : MonoBehaviour
             return;
 
         _slideContacts.Remove(collision.collider);
+    }
+
+    // LANDING ON THE WALL LIP. A touchdown on the rim of an open flume reports a
+    // contact whose normal points up along the lip, not towards the channel centre —
+    // IsInnerSurfaceContact files it as exterior, so it never counts as a slide
+    // contact: no guidance, no touchdown snap, and the body simply toppled off the
+    // outer side and left the course. After a real flight such a touch IS a landing
+    // the player expects to be caught: the body is moved inside the channel (against
+    // the wall it hit) and the outward lateral speed is stripped; the floor contact a
+    // moment later runs the normal touchdown snap that lays the velocity along the
+    // slide. Deliberate jumps (guidance suppressed) and short seam hops are exempt,
+    // so riding over the wall on built-up inertia still ejects as designed.
+    void TryCatchRimLanding(WaterSlideGenerator slide)
+    {
+        if (_rigidbody == null
+            || slide.Enclosure != SlideEnclosure.Open
+            || _timeSinceSlideContact <= 0.3f
+            || _guideSuppressTimer > 0f)
+            return;
+
+        if (!TryGetGuideFrameOnSlide(slide, out Vector3 center, out Vector3 tangent, out Vector3 up, out float halfWidth))
+            return;
+
+        Vector3 right = Vector3.Cross(up, tangent);
+        if (right.sqrMagnitude < 1e-6f)
+            return;
+        right.Normalize();
+
+        Vector3 offset = GetBodyCenterWorld() - center;
+        float lateral = Vector3.Dot(offset, right);
+        float height = Vector3.Dot(offset, up);
+        float bodyRadius = GetLateralBodyExtent();
+        float usableHalf = Mathf.Max(halfWidth - bodyRadius, 0.04f);
+
+        // Only a body over the wall band and around lip height is a rim landing:
+        // inside the channel there is nothing to rescue, far past the wall or low on
+        // the outer face the flight is genuinely outside the course.
+        if (Mathf.Abs(lateral) <= usableHalf
+            || Mathf.Abs(lateral) > halfWidth + bodyRadius * 2f
+            || height < slide.FlumeLipHeight * 0.5f)
+            return;
+
+        float side = Mathf.Sign(lateral);
+        _rigidbody.position += right * (side * usableHalf - lateral);
+
+        Vector3 vel = _rigidbody.linearVelocity;
+        float outward = Vector3.Dot(vel, right) * side;
+        if (outward > 0f)
+            _rigidbody.linearVelocity = vel - right * (side * outward);
     }
 
     // A body pressed against the OUTSIDE of a slide must not ride it: counting that
@@ -1330,7 +1458,16 @@ public class PlayerView : MonoBehaviour
         // travel distance (~0.4 m at speed) ahead of the surface — the body rode an
         // invisible cushion above the slide and lost real contact entirely.
         _rigidbody.collisionDetectionMode = CollisionDetectionMode.Continuous;
-        _rigidbody.constraints = RigidbodyConstraints.FreezeRotation;
+        // Rotation is NOT frozen: the body alignment drives it by setting the angular
+        // velocity every step (see SteerRotationTowards) — sim-driven rotation renders
+        // interpolated, while the former FreezeRotation + per-step MoveRotation combo
+        // teleported the rotation 50 times/s past the interpolation and the model
+        // twitched whenever the target orientation changed fast. Control stays
+        // absolute: the angular velocity is overwritten every step, so contact-induced
+        // spin never survives longer than one step.
+        _rigidbody.constraints = RigidbodyConstraints.None;
+        // Default cap is 7 rad/s — the cross-landing body turn legitimately needs ~30.
+        _rigidbody.maxAngularVelocity = 50f;
         _rigidbody.useGravity = true;
 
         // Soften ring-seam hits: the slide collider is a faceted polyline, and in turns
