@@ -64,6 +64,10 @@ public class PlayerView : MonoBehaviour
     [SerializeField] float _corneringGrip = 20f;
     [Tooltip("Доля сцепления, остающаяся при зажатом A/D на открытом жёлобе (0–1). 0 — руль полностью отпускает доворот (вылет в повороте с рулём мгновенный и не зависит от скорости); 1 — руль не ослабляет сцепление. При 0.35 руление в повороте втрое режет предельную скорость — рискованно, но предсказуемо.")]
     [SerializeField, Range(0f, 1f)] float _steerGripFraction = 0.35f;
+    [Tooltip("Доля сцепления, доступная автоведению БЕЗ нажатых A/D на открытом жёлобе (0–1). 1 — ведение держит любой честный поворот само (вылетов без руля не бывает); меньше — предельная скорость поворота без руля падает до √(доля × сцепление × радиус), выше неё инерция выносит за борт, и поворот нужно ДЕРЖАТЬ рулём в его сторону (сила руля прижимает к внутреннему борту) или сбрасывать скорость S. При 0.55 и сцеплении 20: поворот радиуса 15 м без руля держится до ~12.8 м/с, на потолке 16 м/с уже нужен руль.")]
+    [SerializeField, Range(0f, 1f)] float _autoGripFraction = 0.55f;
+    [Tooltip("Вынос за борт на пределе сцепления: сколько секунд ПОДРЯД требуемое поворотом центростремительное ускорение (скорость × кривизна пути) должно превышать доступное сцепление (доля сцепления с учётом руля; руль В сторону поворота добавляет свою силу, ОТ поворота — вычитает), чтобы жёлоб «отпустил» тело — его подбрасывает вдоль стенки и выносит за внешний борт. Нужно, потому что стенки узкого жёлоба геометрически держат тело как рельсы и честный занос перевалить через борт не может. 0 — механика выключена (вылетов в поворотах не будет).")]
+    [SerializeField] float _wallLaunchDelay = 0.2f;
     [Tooltip("Пауза ведения после намеренного прыжка, сек.")]
     [SerializeField] float _jumpGuideSuppression = 0.6f;
     [Tooltip("Сглаживание направления ведения по пути (больше — быстрее следует за поворотами).")]
@@ -80,8 +84,10 @@ public class PlayerView : MonoBehaviour
     [SerializeField] float _crossLandingTurnRate = 5f;
     [Tooltip("Максимальная длительность окна быстрого доворота, сек — страховка: если довернуться вдоль пути не успели, окно закрывается само.")]
     [SerializeField] float _crossLandingMaxTime = 0.6f;
-    [Tooltip("Антиотскок после приземления, сек: пока идёт окно, скорость при контакте удерживается в плоскости поверхности — «отдача» от гашения падения (импульс контакта, выталкивание из перекрытия) переводится в ход вдоль горки, а не в подскок. Величина скорости сохраняется. Намеренный прыжок (пробел) окно не глушит. 0 — выключить.")]
+    [Tooltip("Антиотскок после приземления, сек: пока идёт окно (или окно удержания ниже), скорость при контакте удерживается в плоскости поверхности — «отдача» от гашения падения (импульс контакта, выталкивание из перекрытия) переводится в ход вдоль горки, а не в подскок. Величина скорости сохраняется. Вне окон при обычной езде НЕ действует (глушил бы честный подъём по стенке). Намеренный прыжок (пробел) окно не глушит. 0 — выключить.")]
     [SerializeField] float _landingNoBounceTime = 0.25f;
+    [Tooltip("Удержание после приземления, сек: столько времени после касания горки тело НЕ может вылететь за борт — у стенки открытого жёлоба оно возвращается внутрь и наружная боковая скорость срезается, вынос инерцией за борт и приземления на кромку тоже ловятся. Намеренный прыжок пробелом работает как обычно. 0 — выключить.")]
+    [SerializeField] float _landingContainTime = 1f;
 
     [Header("Movement")]
     [Tooltip("Ускорение по W вдоль движения, м/с². Работает и на горке, и в воздухе.")]
@@ -136,11 +142,27 @@ public class PlayerView : MonoBehaviour
     bool _crossLandingCheckPending;
     float _crossLandingTimer;
     float _landingNoBounceTimer;
+    // Post-landing containment window (see _landingContainTime): while open, the body
+    // may not leave the channel over a wall — rescues run and the flyout is gated.
+    float _landingContainTimer;
 
     Vector3 _fitCenter;
     float _fitHeight;
     bool _fitInitialized;
     float _slideSteerInput;
+    // Over-grip launch state: the previous smoothed guide tangent (turn-rate probe),
+    // when it was sampled, and how long the corner demand has exceeded the grip.
+    Vector3 _prevGuideTangent;
+    float _prevGuideTangentTime = float.NegativeInfinity;
+    float _overGripTimer;
+    // A failed launch (clipped the lip, fell back in) must not retry instantly —
+    // the retry loop read as the body jerking up the wall and back every ~0.2 s.
+    float _lastWallLaunchTime = float.NegativeInfinity;
+    // Rim plane of the open flume currently guiding the body — published for the
+    // camera so it can proactively stay above the channel rim on banked corners.
+    Vector3 _rimPlanePoint;
+    Vector3 _rimPlaneUp;
+    bool _hasRimPlane;
 
     // Horizontal flight direction, frozen at the moment contact is lost: the whole
     // flight (strafe axis, body yaw, camera) is anchored to it so A/D reads as a
@@ -154,10 +176,35 @@ public class PlayerView : MonoBehaviour
     // Read by WaterSlideCourse: the path generator keeps corners fair for THESE physics
     // values — corner-holding limit √(grip·R) and the braking distance before sharp turns.
     public float CorneringGrip => _corneringGrip;
+
+    // Rim plane of the open flume currently guiding the body: a point at lip-top
+    // level on the channel spine, plane normal = channel up. Kept briefly after
+    // contact loss so camera logic survives the micro-hops of a rough corner; false
+    // in closed tubes and in real flight.
+    public bool TryGetFlumeRimPlane(out Vector3 point, out Vector3 up)
+    {
+        point = _rimPlanePoint;
+        up = _rimPlaneUp;
+        return _hasRimPlane && (IsOnSlide || _timeSinceSlideContact < 0.6f);
+    }
     public float BrakeDeceleration => _brakeAcceleration;
     public float MaxRideSpeed => _maxSlideSpeed;
     public bool IsOnSlide => _slideContacts.Count > 0;
     public bool IsGuided => _hasGuide;
+
+    // An airborne body still inside the current slide's capture volume (a seam hop, a
+    // scramble onto the wall lip that is about to come back down) — the FLIGHT controls
+    // must not engage there: the air strafe fired at full acceleration the instant the
+    // contact flickered and shoved the body sideways off the lip, which read as the
+    // slide itself kicking the player out. False once the body genuinely departs the
+    // channel (past the end, beyond the walls, below the floor) — that is the real
+    // flight to the next slide, where the controls belong. A deliberate jump and the
+    // over-grip launch suppress guidance and get the flight controls immediately.
+    public bool IsAirborneHopNearSlide =>
+        _hasSlideContactSinceSpawn
+        && _guideSuppressTimer <= 0f
+        && _currentSlide != null
+        && TryGetGuideFrameOnSlide(_currentSlide, out _, out _, out _, out _);
     // The initial drop after a spawn/teleport is not a flight between slides.
     public bool HasSlideContactSinceSpawn => _hasSlideContactSinceSpawn;
     // Set by PlayerFlightRagdoll: fitting the capsule to flailing ragdoll bones would
@@ -393,6 +440,10 @@ public class PlayerView : MonoBehaviour
                 // And the no-bounce window: the touchdown must convert the fall into
                 // ride speed, never into a hop off the surface.
                 _landingNoBounceTimer = _landingNoBounceTime;
+                // And the containment window: right after a landing the body may not
+                // leave the channel over a wall (user rule — a fresh landing gets a
+                // beat of safety before flyouts become possible again).
+                _landingContainTimer = _landingContainTime;
             }
             _assistRamp += Time.fixedDeltaTime;
             _timeSinceSlideContact = 0f;
@@ -408,6 +459,8 @@ public class PlayerView : MonoBehaviour
 
         if (_landingNoBounceTimer > 0f)
             _landingNoBounceTimer -= Time.fixedDeltaTime;
+        if (_landingContainTimer > 0f)
+            _landingContainTimer -= Time.fixedDeltaTime;
 
         // The path assist runs ONLY while the body actually touches the slide. Airborne
         // it is fully ballistic — nothing steers, contains or pulls it back — so enough
@@ -448,14 +501,20 @@ public class PlayerView : MonoBehaviour
             vel -= intoSurface;
             _rigidbody.linearVelocity = vel;
         }
-        // No-bounce window after a landing: the contact impulse and the depenetration
-        // push both kick OUTWARD along the normal, and with the touchdown snap feeding
-        // the full fall speed into the ride the kick read as a visible hop off the next
-        // slide. While the window is open the velocity is ROTATED back into the surface
-        // plane (magnitude kept — the kick becomes ride speed, not a jump). The RAW
-        // contact normal is used: the smoothed one still remembers the flight this early.
-        // A deliberate jump suppresses guidance and is never flattened.
-        else if (_landingNoBounceTimer > 0f && _guideSuppressTimer <= 0f)
+        // Anti-bounce inside the post-landing windows (the no-bounce beat AND the
+        // containment second — leaving the channel is forbidden there anyway): the
+        // contact impulse and the depenetration push both kick OUTWARD along the
+        // normal, and with the touchdown snap feeding the full fall speed into the
+        // ride the kick read as a visible hop off the next slide. The outward
+        // velocity is ROTATED back into the surface plane (magnitude kept — the kick
+        // becomes ride speed, not a hop). NOT active during plain riding: an honest
+        // climb up the wall (banked corner, drifting to the lip with no input) reads
+        // as "outward" against the lagging floor-and-wall smoothed normal, and a
+        // full-time flatten kept hurling the body back down into the channel. The
+        // ride-time wall-facet kicks are tamed at the source instead — see the
+        // maxDepenetrationVelocity cap in EnsurePhysicsSetup. A deliberate jump
+        // suppresses guidance and is never flattened.
+        else if ((_landingNoBounceTimer > 0f || _landingContainTimer > 0f) && _guideSuppressTimer <= 0f)
         {
             // Checked against BOTH normals: the raw contact normal (the honest local
             // facet), and the smoothed one — a high-speed impact on a triangle edge
@@ -483,7 +542,13 @@ public class PlayerView : MonoBehaviour
         // the floor and the facing wall, and the full press squeezed the body INTO the
         // wedge for seconds — penetration grew until depenetration found the shortest
         // exit on the OUTER side and popped the body through the shell.
-        float stickScale = (1f - Mathf.Clamp01(Mathf.Abs(_slideSteerInput))) * Mathf.Clamp01(speed / 3f);
+        // Muted while guidance is suppressed (deliberate jump, over-grip launch): near
+        // the floor-wall junction the smoothed normal averages both faces and the
+        // press gains a tangential component DOWN the wall (up to ~21 м/с²) — enough
+        // to stall a takeoff that climbs along the wall before it clears the lip.
+        float stickScale = _guideSuppressTimer > 0f
+            ? 0f
+            : (1f - Mathf.Clamp01(Mathf.Abs(_slideSteerInput))) * Mathf.Clamp01(speed / 3f);
         if (stickScale > 0f)
             _rigidbody.AddForce(-normal * (_stickAcceleration * stickScale), ForceMode.Acceleration);
 
@@ -599,6 +664,11 @@ public class PlayerView : MonoBehaviour
         // inertia carries it over — the player can SEE that braking is needed.
         // Steering input keeps a fraction of grip instead of zeroing it: a binary
         // release made any A/D touch in a corner an instant, speed-independent flyout.
+        // WITHOUT input the assist also gets only a FRACTION of the grip
+        // (_autoGripFraction): the course generator widens every corner to fit the FULL
+        // grip at the projected speed, so at full auto-grip the ride self-steered every
+        // corner and flyouts never happened hands-off. A fast corner must now be HELD —
+        // steer into it (the steer force supplies the missing centripetal push) or brake.
         // A closed tube keeps the old fixed rate — the bore contains the body anyway,
         // and grip-starving the steer there only makes it bang around the walls.
         float speed = vel.magnitude;
@@ -673,7 +743,7 @@ public class PlayerView : MonoBehaviour
                 bool openFlume = slide.Enclosure == SlideEnclosure.Open;
                 float steerRate = openFlume ? Mathf.Min(_velocitySteer, _corneringGrip / speed) : _velocitySteer;
                 float inputScale = openFlume
-                    ? Mathf.Lerp(1f, _steerGripFraction, Mathf.Clamp01(Mathf.Abs(_slideSteerInput)))
+                    ? Mathf.Lerp(_autoGripFraction, _steerGripFraction, Mathf.Clamp01(Mathf.Abs(_slideSteerInput)))
                     : steerFree;
                 maxRadians = steerRate * catchAssist * inputScale * Time.fixedDeltaTime;
             }
@@ -710,8 +780,11 @@ public class PlayerView : MonoBehaviour
             // Rim landing whose contact still classified as INNER (the lip normal can
             // tip either way): same rescue as the collision-side catch — while the
             // landing window is open, a body over the wall band is put back inside the
-            // channel instead of toppling off the outer side.
-            if (_landingNoBounceTimer > 0f && Mathf.Abs(lateral) > usableHalf + bodyRadius * 0.5f)
+            // channel instead of toppling off the outer side. The containment window
+            // extends this: for _landingContainTime after ANY fresh landing the body
+            // may not leave over a wall at all.
+            if ((_landingNoBounceTimer > 0f || _landingContainTimer > 0f)
+                && Mathf.Abs(lateral) > usableHalf + bodyRadius * 0.5f)
             {
                 float side = Mathf.Sign(lateral);
                 _rigidbody.position += right * (side * usableHalf - lateral);
@@ -719,6 +792,92 @@ public class PlayerView : MonoBehaviour
                 float outwardVel = Vector3.Dot(vel, right) * side;
                 if (outwardVel > 0f)
                     vel -= right * (side * outwardVel);
+            }
+
+            // OVER-GRIP LAUNCH — the flyout mechanic. The flume is barely wider than
+            // the body and its walls are near-vertical: a body over the corner speed
+            // limit does NOT climb out — the wall guides it around like a rail
+            // (unlimited centripetal force from the rigid contact), so no amount of
+            // grip starving can ever produce a flyout by honest drift. The release is
+            // therefore explicit: while the IN-PLANE turn rate of the path demands
+            // more centripetal acceleration than the grip provides (steer input
+            // towards the corner adds the steer force, away from it subtracts), the
+            // wall is doing the holding; after _wallLaunchDelay seconds of that the
+            // channel lets go — the body is popped along the wall just hard enough to
+            // clear the lip (computed from the effective gravity) and its own inertia
+            // carries it over the OUTER side of the corner.
+            if (_wallLaunchDelay > 0f && !crossCatch
+                && _landingNoBounceTimer <= 0f && _landingContainTimer <= 0f
+                && assist >= 0.9f && speed > 6f
+                && Time.fixedTime - _prevGuideTangentTime < Time.fixedDeltaTime * 1.9f)
+            {
+                // Turn rate around the channel up only: loops and crests bend the
+                // tangent in the VERTICAL plane and must not read as cornering.
+                Vector3 prevFlat = Vector3.ProjectOnPlane(_prevGuideTangent, guideUp);
+                Vector3 curFlat = Vector3.ProjectOnPlane(tangent, guideUp);
+                if (prevFlat.sqrMagnitude > 0.1f && curFlat.sqrMagnitude > 0.1f)
+                {
+                    float omega = Vector3.Angle(prevFlat, curFlat) * Mathf.Deg2Rad / Time.fixedDeltaTime;
+                    float needed = speed * omega;
+                    float gripScale = Mathf.Lerp(_autoGripFraction, _steerGripFraction,
+                        Mathf.Clamp01(Mathf.Abs(_slideSteerInput)));
+                    float inwardSign = Mathf.Sign(Vector3.Dot(curFlat - prevFlat, right));
+                    float available = _corneringGrip * gripScale
+                        + _slideSteerInput * inwardSign * _slideSteerForce;
+                    _overGripTimer = needed > available + 0.5f
+                        ? _overGripTimer + Time.fixedDeltaTime
+                        : Mathf.Max(0f, _overGripTimer - 4f * Time.fixedDeltaTime);
+                    // FIRE GATES — the trigger (force balance) stays as is, but the pop
+                    // itself may only fire when it can COMPLETE as a flyout; a pop that
+                    // cannot depart just tosses the body up and drops it back into the
+                    // channel — read exactly as "the side wall kicks me for nothing".
+                    // (1) The body must actually BE on the outer wall: the "wall holds
+                    // like a rail" premise is false mid-channel, where the body is still
+                    // honestly drifting outward and needs no release.
+                    // (2) The corner must KEEP turning ahead: the escape is ballistic
+                    // (the path curves away under the airborne body), so a launch at the
+                    // corner exit has nothing to carry it out. The timer keeps running
+                    // while a gate blocks, so the pop fires the moment both hold.
+                    bool onOuterWall = lateral * inwardSign < -usableHalf * 0.45f;
+                    if (_overGripTimer >= _wallLaunchDelay
+                        && Time.fixedTime - _lastWallLaunchTime > 1.2f
+                        && onOuterWall
+                        && CornerCarriesOutAhead(slide, guideUp, curFlat, inwardSign, speed))
+                    {
+                        _overGripTimer = 0f;
+                        _lastWallLaunchTime = Time.fixedTime;
+                        // PURE vertical pop, no outward push: the body is pressed
+                        // against the OUTER wall, so an outward component points INTO
+                        // the wall — the contact ate it instantly while keeping the
+                        // contact (and the stick press) alive, and the launch stalled
+                        // below the lip (visible as jerking up the wall and back).
+                        // Vertically the escape is free, and the outward part comes by
+                        // itself: the path keeps curving away while the airborne body
+                        // flies straight, so it departs over the lip ballistically.
+                        // CLEARANCE MARGIN — this is the "clean flyout or hold, never a
+                        // stalled push" guarantee. The pop must lift the body clear ABOVE
+                        // the lip and keep it there long enough for the curving path to
+                        // carry it out; a pop that only just reaches the lip is pulled
+                        // straight back by gravity before it departs — read exactly as
+                        // "the edge shoves me up and back". The old +0.35 m / ×1.1 / 0.3 s
+                        // margins were tuned at gravity ×1.8; at ×2 the ballistic return
+                        // is faster, so the same numbers under-clear and the launch
+                        // stalls. Overshoot the lip with room to spare (GravityMultiplier
+                        // already scales the energy, so this stays correct at any weight).
+                        float heightInFrame = Vector3.Dot(offset, guideUp);
+                        float rise = Mathf.Max(slide.FlumeLipHeight + 0.6f - heightInFrame, 0.5f);
+                        float upSpeed = Mathf.Sqrt(2f * Physics.gravity.magnitude * GravityMultiplier * rise) * 1.2f;
+                        vel += guideUp * upSpeed;
+                        // A launch is a real takeoff: suppress the guidance like a
+                        // deliberate jump so the following steps don't steer and damp
+                        // the body straight back into the channel (the suppression
+                        // also mutes the surface stick press — see FixedUpdate).
+                        // Held longer than the old 0.3 s: under gravity ×2 the body needs
+                        // more airtime to clear the lip before the guide can recapture it
+                        // and yank it back inside (the "and back" half of the stall).
+                        _guideSuppressTimer = Mathf.Max(_guideSuppressTimer, 0.45f);
+                    }
+                }
             }
 
             // Soft feel-assists only: damp the side-to-side oscillation and drift back
@@ -730,12 +889,32 @@ public class PlayerView : MonoBehaviour
             {
                 float lateralVel = Vector3.Dot(vel, right);
                 _rigidbody.AddForce(right * (-lateralVel * _lateralDamping * catchAssist * steerFree), ForceMode.Acceleration);
+                // The centreline pull must not act as EXTRA grip: in a corner the grip
+                // model has already lost, the pull (up to _centeringAccel at the band
+                // edge) quietly supplied the missing centripetal force and held corners
+                // the reduced auto-grip was meant to lose. Detected via the steer lag:
+                // while the steer keeps up, the velocity trails the path by ~1° per
+                // step; a saturated steer lets the lag grow, so fade the pull out over
+                // 4°→8° of lag and let the drift carry the body up the outer wall.
+                float driftFree = 1f - Mathf.Clamp01((Vector3.Angle(vel, tangent) - 4f) / 4f);
                 if (_centeringAccel > 0f && Mathf.Abs(lateral) < limit)
-                    _rigidbody.AddForce(right * (-lateral * _centeringAccel * assist * steerFree), ForceMode.Acceleration);
+                    _rigidbody.AddForce(right * (-lateral * _centeringAccel * assist * steerFree * driftFree), ForceMode.Acceleration);
             }
+
+            // Published every guided open-flume step: the turn-rate probe for the
+            // over-grip launch above, and the rim plane for the camera (a point at
+            // lip-top level, plane normal = channel up) so it can proactively stay
+            // above the channel rim on banked corners.
+            _prevGuideTangent = tangent;
+            _prevGuideTangentTime = Time.fixedTime;
+            _rimPlanePoint = center + guideUp * slide.FlumeLipHeight;
+            _rimPlaneUp = guideUp;
+            _hasRimPlane = true;
         }
         else
         {
+            _hasRimPlane = false;
+
             // Closed tube: the mesh collider owns containment. Only damp the pendulum
             // swing around the ring so the body doesn't oscillate wall-to-wall forever;
             // the forward speed is untouched.
@@ -783,6 +962,47 @@ public class PlayerView : MonoBehaviour
             vel *= Mathf.Lerp(1f, _maxSlideSpeed / guidedSpeed, assist);
 
         _rigidbody.linearVelocity = vel;
+    }
+
+    // Whether the corner KEEPS turning the same way far enough ahead for a wall
+    // launch to depart. The pop is purely vertical: the outward escape only comes
+    // from the path curving away under the airborne body, so a pop fired near the
+    // corner EXIT (the path straightens right after) just hops up and drops back
+    // into the channel — read as the side wall kicking the player for nothing.
+    // Walk the ride frames over the distance the first half-second of flight covers
+    // (that is what carries the body over the lip) and require the path to keep
+    // turning the SAME way by enough to open a body-wide gap (~12°: at ride speed
+    // the lateral gap s·θ/2 is then well past the capsule radius).
+    bool CornerCarriesOutAhead(WaterSlideGenerator slide, Vector3 guideUp, Vector3 curFlat, float inwardSign, float speed)
+    {
+        var frames = slide.RideFrames;
+        if (frames == null || frames.Count < 2)
+            return false;
+
+        int i = Mathf.Clamp(_lastGuideIndex, 0, frames.Count - 1);
+        // Frames are ordered along the path; the tangent may be riding them in
+        // reverse (the sign flip in GuideAlongSlide), so walk in the riding direction.
+        float dirDot = Vector3.Dot(_smoothedGuideTangent, frames[i].Forward);
+        int dir = dirDot >= 0f ? 1 : -1;
+
+        float lookahead = Mathf.Max(speed * 0.45f, 4f);
+        float travelled = 0f;
+        int j = i;
+        while (j + dir >= 0 && j + dir < frames.Count && travelled < lookahead)
+        {
+            travelled += Vector3.Distance(frames[j].Position, frames[j + dir].Position);
+            j += dir;
+        }
+
+        Vector3 aheadFlat = Vector3.ProjectOnPlane(frames[j].Forward * dir, guideUp);
+        if (aheadFlat.sqrMagnitude < 0.01f)
+            return false;
+
+        // Positive SignedAngle around guideUp bends the tangent toward the frame
+        // right — the same convention inwardSign was measured with, so the product
+        // is positive only when the path ahead keeps turning INTO the same corner.
+        float turnAhead = Vector3.SignedAngle(curFlat, aheadFlat, guideUp);
+        return turnAhead * inwardSign >= 12f;
     }
 
     WaterSlideGenerator ResolveGuideSlide()
@@ -1044,21 +1264,34 @@ public class PlayerView : MonoBehaviour
         if (_rigidbody == null || _rigidbody.isKinematic)
             return;
 
-        // A short grace after losing contact: a hop over a seam must not flip the body
-        // into the air alignment for a few frames — the orientation stays along the
-        // slide so the body settles straight back. A deliberate jump suppresses
-        // guidance and skips the grace, so the flight pose engages immediately.
+        // A grace after losing contact: a hop over a seam must not flip the body
+        // into the air alignment — the orientation stays along the slide so the body
+        // settles straight back. 0.6 s, not shorter: with A/D held the surface press
+        // is muted and the wall-side hops regularly last 0.3–0.5 s; falling into the
+        // air branch there yawed the body to the flight heading — the DIAGONAL strafe
+        // velocity — so steering read as the character turning off the tube. A
+        // deliberate jump suppresses guidance and skips the grace, so the flight
+        // pose engages immediately; a real flight flips over once the grace runs out.
+        const float RidingOrientationGrace = 0.6f;
         bool ridingGrace = _hasSlideContactSinceSpawn
             && _guideSuppressTimer <= 0f
-            && _timeSinceSlideContact < 0.25f;
+            && _timeSinceSlideContact < RidingOrientationGrace;
         if (IsOnSlide || _hasGuide || ridingGrace)
         {
             Vector3 normal = _slideNormal;
 
             // Prefer the path tangent: it is smooth along the whole slide, while velocity
-            // direction wobbles with every contact and makes the body twitch.
-            Vector3 forward = _hasGuide
-                ? Vector3.ProjectOnPlane(_guideTangent, normal)
+            // direction wobbles with every contact and makes the body twitch. The LAST
+            // smoothed tangent also covers the steps where the guide is momentarily gone
+            // (micro contact loss on seams — frequent with A/D held, because the input
+            // mutes the surface press): falling back to the velocity there yawed the
+            // body towards the DIAGONAL strafe motion on every flicker — read as "the
+            // character turns across the slide whenever I steer". The body must always
+            // lie ALONG the slide while riding; the steer forces are lateral-only and
+            // remain untouched by this.
+            bool freshTangent = _hasSmoothedGuideTangent && _timeSinceSlideContact < RidingOrientationGrace;
+            Vector3 forward = _hasGuide || freshTangent
+                ? Vector3.ProjectOnPlane(_smoothedGuideTangent, normal)
                 : Vector3.ProjectOnPlane(_rigidbody.linearVelocity, normal);
             if (forward.sqrMagnitude < 0.25f)
                 forward = Vector3.ProjectOnPlane(transform.forward, normal);
@@ -1247,9 +1480,13 @@ public class PlayerView : MonoBehaviour
     // so riding over the wall on built-up inertia still ejects as designed.
     void TryCatchRimLanding(WaterSlideGenerator slide)
     {
+        // Normally only a touch after a REAL flight is a rim landing (seam hops must
+        // not trigger the rescue) — but inside the post-landing containment window
+        // every rim touch is caught: the body may not leave the channel at all there,
+        // including via a short hop onto the lip right after touchdown.
         if (_rigidbody == null
             || slide.Enclosure != SlideEnclosure.Open
-            || _timeSinceSlideContact <= 0.3f
+            || (_timeSinceSlideContact <= 0.3f && _landingContainTimer <= 0f)
             || _guideSuppressTimer > 0f)
             return;
 
@@ -1440,6 +1677,11 @@ public class PlayerView : MonoBehaviour
         _crossLandingCheckPending = false;
         _crossLandingTimer = 0f;
         _landingNoBounceTimer = 0f;
+        _landingContainTimer = 0f;
+        _overGripTimer = 0f;
+        _prevGuideTangentTime = float.NegativeInfinity;
+        _lastWallLaunchTime = float.NegativeInfinity;
+        _hasRimPlane = false;
         _fitInitialized = false;
         UpdateColliderPose();
     }
@@ -1472,8 +1714,12 @@ public class PlayerView : MonoBehaviour
 
         // Soften ring-seam hits: the slide collider is a faceted polyline, and in turns
         // the capsule meets each next facet at a small head-on angle. A capped
-        // depenetration velocity turns the pop-out kick into a gentle push.
-        _rigidbody.maxDepenetrationVelocity = 2.5f;
+        // depenetration velocity turns the pop-out kick into a gentle push. 1.0, down
+        // from 2.5: riding pressed against a wall, every facet delivered its pop-out
+        // as a sideways kick off the wall — at 2.5 м/с per step it read as endlessly
+        // bouncing off the walls. Overlaps now resolve over a few frames instead of
+        // one; the contact offset and CCD keep them small to begin with.
+        _rigidbody.maxDepenetrationVelocity = 1f;
 
         if (_capsule == null)
             return;

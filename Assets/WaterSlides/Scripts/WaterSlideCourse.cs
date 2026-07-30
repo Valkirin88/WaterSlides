@@ -46,10 +46,10 @@ namespace WaterSlides
         [Tooltip("Максимальная просадка входа следующей горки вниз, м. Если баллистике при расчётной скорости нужно упасть глубже — дистанция прыжка урезается, чтобы вписаться в этот предел. Это ГЛАВНЫЙ ограничитель того, как далеко разлетаются горки: дальше по горизонтали = физически ниже (баллистика), поэтому маленький предел жмёт горки близко. Больше — горки дальше и с более глубокими провалами между ними.")]
         [Min(1f)] public float MaxJumpDrop = 16f;
 
-        [Tooltip("Диапазон смещения начала следующей трубы по оси X (мировые координаты, метры).")]
+        [Tooltip("Диапазон смещения начала следующей горки ВБОК от направления вылета (метры; минус — влево, плюс — вправо). Задаёт разброс трассы по ширине; вход при этом строится вдоль реальной хорды прыжка, поэтому угол входа остаётся согласован с полётом.")]
         public FloatRange JumpOffsetX = new() { Min = -3f, Max = 3f };
 
-        [Tooltip("Диапазон смещения начала следующей трубы по оси Z (мировые координаты, метры).")]
+        [Tooltip("Диапазон добавки к дистанции прыжка ВДОЛЬ направления вылета (метры, отрицательные значения обрезаются в 0). Раньше оба смещения были в МИРОВЫХ осях: при развороте трассы «вдольная» добавка могла лечь против вылета, сжать горизонталь прыжка и построить вход крутым обрывом под другим углом, чем конец предыдущей горки.")]
         public FloatRange JumpOffsetZ = new() { Min = -3f, Max = 3f };
 
         [Tooltip("Макс. отклонение старта первой горки от вертикали (градусы). Следующие зеркалят угол выхода.")]
@@ -445,8 +445,7 @@ namespace WaterSlides
                 // void. Now a slow exit still reaches the entry, and a fast one simply
                 // overflies it and lands a bit further along the slide.
                 bool hasNextJump = i < SlideCount - 1;
-                float jumpGap = 0f, jumpStep = 0f;
-                Vector3 jumpOffsetXZ = Vector3.zero;
+                float jumpForward = 0f, jumpLateral = 0f, jumpStep = 0f;
 
                 // Exit style: up (ski jump), down along the launch (match), or straight.
                 float kickAngle = 0f, kickLength = 0f;
@@ -461,15 +460,17 @@ namespace WaterSlides
 
                 if (hasNextJump)
                 {
-                    jumpGap = Mathf.Max(JumpGap.Sample(slideRng), 1f);
-                    jumpOffsetXZ = new Vector3(JumpOffsetX.Sample(slideRng), 0f, JumpOffsetZ.Sample(slideRng));
-
-                    // The offset direction relative to the exit heading is unknown until
-                    // the slide is built, so budget for the worst case (offset fully
-                    // co-directional) — overestimating the distance only lowers the
-                    // entry, which is the safe direction.
-                    float offsetMag = new Vector2(jumpOffsetXZ.x, jumpOffsetXZ.z).magnitude;
-                    float distance = jumpGap + offsetMag;
+                    // The offsets are relative to the EXIT HEADING (lateral / along), not
+                    // world axes: a world-axis offset rotated with the course, and when it
+                    // happened to point AGAINST the exit it shrank the jump's horizontal
+                    // reach while the drop was budgeted for a longer one — the entry got
+                    // built as a steep cliff at a very different angle than the previous
+                    // exit. Heading-relative offsets make the horizontal chord length
+                    // exact BEFORE the slide is built, so the drop matches the geometry.
+                    jumpForward = Mathf.Max(JumpGap.Sample(slideRng), 1f)
+                        + Mathf.Max(JumpOffsetZ.Sample(slideRng), 0f);
+                    jumpLateral = JumpOffsetX.Sample(slideRng);
+                    float distance = Mathf.Sqrt(jumpForward * jumpForward + jumpLateral * jumpLateral);
 
                     float gravity = PlayerGravity();
                     float speed = Mathf.Max(AssumedExitSpeed, 3f);
@@ -494,9 +495,13 @@ namespace WaterSlides
                     if (jumpStep > MaxJumpDrop)
                     {
                         // Too deep — keep the drop and shorten the jump instead, so the
-                        // entry stays on the assumed-speed arc.
+                        // entry stays on the assumed-speed arc. The chord shrinks
+                        // PROPORTIONALLY (forward and lateral together), preserving its
+                        // direction relative to the exit.
                         float maxDistance = BallisticDistanceAt(MaxJumpDrop / safety, speed, launchDown, gravity);
-                        jumpGap = Mathf.Max(maxDistance - offsetMag, 1.5f);
+                        float scale = Mathf.Min(1f, maxDistance / Mathf.Max(distance, 0.01f));
+                        jumpForward = Mathf.Max(jumpForward * scale, 1.5f);
+                        jumpLateral *= scale;
                         jumpStep = MaxJumpDrop;
                     }
                     jumpStep = Mathf.Max(jumpStep, Mathf.Min(MinJumpDrop, MaxJumpDrop));
@@ -543,12 +548,16 @@ namespace WaterSlides
                         heading = Vector3.forward;
                     heading.Normalize();
 
-                    // Jump forward along the exit heading and down by the BALLISTIC drop
-                    // computed above for AssumedExitSpeed — the entry sits on (or slightly
-                    // below) the assumed flight arc. The values were pre-sampled before
-                    // building this slide — the "match" exit style bent the lip to
-                    // exactly this launch angle.
-                    Vector3 landing = worldEnd + heading * jumpGap + jumpOffsetXZ + Vector3.down * jumpStep;
+                    // Jump forward along the exit heading (plus the heading-relative
+                    // lateral offset) and down by the BALLISTIC drop computed above for
+                    // AssumedExitSpeed — the entry sits on (or slightly below) the
+                    // assumed flight arc. The values were pre-sampled before building
+                    // this slide — the "match" exit style bent the lip to exactly this
+                    // launch angle.
+                    Vector3 exitRight = Vector3.Cross(Vector3.up, heading);
+                    exitRight = exitRight.sqrMagnitude > 1e-4f ? exitRight.normalized : Vector3.right;
+                    Vector3 landing = worldEnd + heading * jumpForward + exitRight * jumpLateral
+                        + Vector3.down * jumpStep;
 
                     // Entry aims along the actual jump chord, so it stays codirectional with the flight.
                     pendingEntryDir = (landing - worldEnd).normalized;
@@ -570,7 +579,8 @@ namespace WaterSlides
                     // the entry flume up the chord catches those arcs from the INSIDE. Fast
                     // exits are unaffected — their flatter arcs still overfly the entry and land
                     // further along the slide, as before.
-                    float catchLength = Mathf.Clamp(jumpGap * 0.6f, 3f, 12f);
+                    float catchLength = Mathf.Clamp(
+                        Mathf.Sqrt(jumpForward * jumpForward + jumpLateral * jumpLateral) * 0.6f, 3f, 12f);
                     pendingCatchLength = catchLength;
                     cursorPos = landing - pendingEntryDir * catchLength;
                 }

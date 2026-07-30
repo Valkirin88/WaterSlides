@@ -47,8 +47,16 @@ public class PlayerController
 
         if (_playerView.IsOnSlide)
             ApplySlideMovement(input);
-        else
+        // Flight controls only in a REAL flight — the body has left the channel (or
+        // jumped deliberately). During a short hop still over the slide (a seam
+        // bounce, a scramble onto the wall lip with A/D held) the strafe used to fire
+        // at full air acceleration the moment the contact flickered and shoved the
+        // body off the lip — read as the slide kicking the player out. Such hops are
+        // now purely ballistic; space during a hop still jumps like from the slide.
+        else if (!_playerView.IsAirborneHopNearSlide)
             ApplyAirMovement(input);
+        else if (input.JumpPressed)
+            JumpOffSlide();
     }
 
     // W accelerates along the current motion, S bleeds speed off. Acceleration respects
