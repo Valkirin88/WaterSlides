@@ -31,14 +31,14 @@ Shader "Hidden/WaterSlides/SpeedRush"
                 float amount = _Strength * mask;
 
                 // "Stretch": pull the picture outwards from the centre.
-                float2 uv = centre + fromCentre * (1.0 - _Stretch * _Strength);
+                float2 uv = centre + fromCentre * (1.0 - _Stretch * _Strength * 0.3);
 
                 fixed4 acc = 0;
                 [unroll]
                 for (int s = 0; s < 8; s++)
                 {
                     float t = s / 7.0;
-                    acc += tex2D(_MainTex, uv - fromCentre * (t * _BlurLength * amount));
+                    acc += tex2D(_MainTex, uv - fromCentre * (t * _BlurLength * amount * 0.2));
                 }
 
                 return acc / 8.0;

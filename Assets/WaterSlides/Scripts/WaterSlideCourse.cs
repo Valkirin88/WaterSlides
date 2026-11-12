@@ -33,6 +33,19 @@ namespace WaterSlides
         [Tooltip("Автоматически перестраивать курс при изменении параметров в Inspector.")]
         public bool LiveUpdate = true;
 
+        [SerializeField, HideInInspector] bool _preserveSceneLayout;
+        internal bool PreservesSceneLayout => _preserveSceneLayout;
+
+        [Header("Endless")]
+        [Tooltip("Бесконечная трасса: в Play-режиме новые горки достраиваются впереди игрока, а далеко отставшие удаляются. Slide Count задаёт только стартовый набор в сцене.")]
+        public bool Endless = true;
+
+        [Tooltip("Сколько горок всегда держать ВПЕРЕДИ той, по которой едет игрок.")]
+        [Min(1)] public int SlidesAhead = 3;
+
+        [Tooltip("Сколько горок оставлять ПОЗАДИ игрока (остальные удаляются). Респавн после падения — на самую раннюю из оставшихся.")]
+        [Min(1)] public int SlidesBehind = 1;
+
         [Header("Connection Between Slides")]
         [Tooltip("Желаемая дистанция прыжка вдоль направления вылета с конца предыдущей горки (метры). Может быть урезана, если баллистика при расчётной скорости вылета не дотягивает (см. AssumedExitSpeed и MaxJumpDrop).")]
         public FloatRange JumpGap = new() { Min = 4f, Max = 9f };
@@ -76,6 +89,12 @@ namespace WaterSlides
 
         [Tooltip("Разрешить спирали на закрытых трубах (экспериментально, может давать петли).")]
         public bool AllowLoopsAndSpirals = false;
+
+        [Tooltip("Расширять повороты, которые на расчётной скорости подхода не удержать (вкл — крутых поворотов на быстрой трассе почти не остаётся). Выкл — радиус остаётся крутым, перед поворотом вставляется прямая, где игрок может затормозить сам; не затормозил — вылетел.")]
+        public bool WidenUnfairTurns = true;
+
+        [Tooltip("Доля дистанции прыжка, на которую вход следующей горки продлевается НАЗАД вверх по хорде (ловля медленных вылетов). 0.6 — ловит вылеты вплоть до ~8 м/с; 0.3 — заторможенный вылет не долетает, нужно разгоняться (W) перед концом горки.")]
+        [Range(0f, 0.8f)] public float CatchRampFraction = 0.6f;
 
         [Header("Loops")]
         [Tooltip("Добавлять петли некоторым горкам (не всем).")]
@@ -165,6 +184,74 @@ namespace WaterSlides
         [Tooltip("Форма открытых горок: квадратный желоб, округлый или случайный выбор.")]
         public OpenShapeMode OpenFlumeShapeMode = OpenShapeMode.Mixed;
 
+        [Header("Stripes")]
+        [Tooltip("Красить открытые горки поперечными цветными полосами (как у больших парковых горок) вместо одного цвета из палитр ниже.")]
+        public bool StripedSlides = true;
+
+        [Tooltip("Палитра полос; каждая горка получает свою случайную последовательность.")]
+        public Color[] StripeColors =
+        {
+            new(0.10f, 0.35f, 0.85f, 1f),
+            new(0.40f, 0.72f, 0.95f, 1f),
+            new(0.98f, 0.82f, 0.12f, 1f),
+            new(0.96f, 0.96f, 0.94f, 1f),
+            new(0.20f, 0.78f, 0.72f, 1f),
+            new(0.06f, 0.14f, 0.48f, 1f),
+            new(0.90f, 0.16f, 0.12f, 1f)
+        };
+
+        [Tooltip("Длина одной полосы вдоль горки, м.")]
+        [Min(0.5f)] public float StripeLength = 5f;
+
+        [Tooltip("Доля горок с ПРОДОЛЬНЫМИ полосами (цветные дорожки по ширине жёлоба). В референсах (Planet Coaster 2) полосы поперечные — 0.")]
+        [Range(0f, 1f)] public float StripesAlongChance = 0f;
+
+        [Tooltip("Доля горок со СМЕШАННОЙ палитрой (красный, жёлтый, синий, белый вперемешку, как на парковых горках); остальные — секции в оттенках одного базового цвета, свой у каждой горки.")]
+        [Range(0f, 1f)] public float MixedPaletteChance = 0.5f;
+
+        [Tooltip("Число продольных дорожек по ширине жёлоба.")]
+        public IntRange StripeLanes = new() { Min = 4, Max = 6 };
+
+        [Header("Boost Strips")]
+        [Tooltip("Ускоряющих полос на горку (случайно из диапазона). Полоса разгоняет тело и поднимает потолок скорости (см. PlayerView: Boost Acceleration / Boost Speed Bonus) — замена газу W, которого на телефоне нет.")]
+        public IntRange BoostStripsPerSlide = new() { Min = 1, Max = 2 };
+        [Tooltip("Длина ускоряющей полосы, м.")]
+        [Min(1f)] public float BoostStripLength = 6f;
+        [Tooltip("Материал ускоряющих полос (создаёт меню Water Slides/Setup Controls). Пусто — полосы работают, но не рисуются.")]
+        public Material BoostStripMaterial;
+
+        [Header("Glass Tubes")]
+        [Tooltip("Закрытые трубы — прозрачное стекло со светящимися кольцами подсветки (цвета из палитры полос).")]
+        public bool GlassTubes = true;
+
+        [Tooltip("Шаг колец подсветки вдоль трубы, м.")]
+        public FloatRange TubeRingSpacing = new() { Min = 2.5f, Max = 4f };
+
+        [Tooltip("Прозрачность стекла (альфа): 0 — невидимое, 1 — непрозрачное.")]
+        [Range(0.05f, 0.8f)] public float GlassOpacity = 0.28f;
+
+        [Tooltip("Доля ОТКРЫТЫХ жёлобов из прозрачного стекла с неоновыми кольцами (как прозрачные горки в рилсах): 0 — только полосатые, 1 — все стеклянные. Не требует закрытых труб.")]
+        [Range(0f, 1f)] public float GlassOpenChance = 0f;
+
+        [Tooltip("Доля стеклянных горок из БЕСЦВЕТНОГО стекла (как прозрачная горка над Дубаем в рилсе: стекло почти невидимо, светятся только кромки); остальные — голубое тонированное.")]
+        [Range(0f, 1f)] public float GlassClearChance = 0.5f;
+
+        [Tooltip("Доля стеклянных открытых горок с U-образным профилем (плоское дно, стенки, неон по двум уголкам) вместо скруглённого.")]
+        [Range(0f, 1f)] public float GlassSquareChance = 0.5f;
+
+        [Tooltip("Доля стеклянных горок с частой неоновой решёткой (сеткой). Остальные поровну: линии вдоль + кольца, только вдоль, только кольца.")]
+        [Range(0f, 1f)] public float GlassGridChance = 0.25f;
+
+        [Tooltip("Палитра неона стеклянных горок (кромки, линия по дну, кольца): цвет выбирается случайно на горку. Пусто — берётся из палитры полос.")]
+        public Color[] GlassNeonColors =
+        {
+            new Color(1f, 0.2f, 0.75f, 1f),   // розовый (Майами)
+            new Color(0.2f, 0.8f, 1f, 1f),    // голубой
+            new Color(1f, 0.65f, 0.15f, 1f),  // золотой (Дубай)
+            new Color(0.6f, 0.3f, 1f, 1f),    // фиолетовый
+            new Color(0.3f, 1f, 0.6f, 1f)     // мятный
+        };
+
         [Header("Colors — Open Square")]
         [Tooltip("Палитра цветов для открытых горок с квадратным (U-образным) сечением.")]
         public Color[] OpenSquareColors =
@@ -195,7 +282,25 @@ namespace WaterSlides
         readonly List<WaterSlideGenerator> _slides = new();
         WaterSlideWater _waterPreset;
 
+        // Состояние «продолжения» трассы — всё, что нужно, чтобы достроить следующую
+        // горку к уже построенным. Сериализуется вместе со сценой: горки, собранные в
+        // редакторе, в Play-режиме продолжаются ровно оттуда, где кончились.
+        [SerializeField, HideInInspector] int _baseSeed;
+        [SerializeField, HideInInspector] int _nextSlideIndex;
+        [SerializeField, HideInInspector] Vector3 _cursorPos;
+        [SerializeField, HideInInspector] Vector3 _pendingEntryDir;
+        [SerializeField, HideInInspector] float _pendingCatchLength;
+
+        // Глобальный индекс _slides[0] (горки позади игрока удаляются).
+        int _firstSlideIndex;
+        PlayerView _player;
+        float _nextStreamCheck;
+
         public IReadOnlyList<WaterSlideGenerator> Slides => _slides;
+
+        // Растёт при каждом изменении набора горок (достройка/удаление) — потребители
+        // (сетка высоты падения в EntryPoint) пересчитывают свои кэши.
+        public int SlidesVersion { get; private set; }
 
         // Speed needed to clear ANY jump of this course, with a small margin. The jumps
         // are PLACED from ballistics for AssumedExitSpeed under the player's actual
@@ -294,6 +399,81 @@ namespace WaterSlides
             GenerateCourse();
         }
 
+        // ---- Бесконечная трасса: достройка впереди, удаление позади ----
+
+        void Update()
+        {
+            if (!Application.isPlaying || !Endless || _slides.Count == 0)
+                return;
+
+            if (Time.time < _nextStreamCheck)
+                return;
+            _nextStreamCheck = Time.time + 0.2f;
+
+            if (_player == null)
+                _player = FindFirstObjectByType<PlayerView>();
+            if (_player == null)
+                return;
+
+            int playerIndex = ResolvePlayerSlideIndex();
+            if (playerIndex < 0)
+                return;
+
+            // По одной горке за проверку: сборка меша + коллайдера + воды — заметная
+            // работа, размазываем её по кадрам.
+            if (_slides.Count - 1 - playerIndex < SlidesAhead)
+                AppendNextSlide();
+            else if (playerIndex > SlidesBehind)
+                RemoveOldestSlide();
+        }
+
+        // Локальный индекс горки игрока в _slides: та, к которой он пристёгнут (или от
+        // которой оторвался); до первого касания — ближайшая по кадрам пути.
+        int ResolvePlayerSlideIndex()
+        {
+            var current = _player.CurrentSlide;
+            if (current != null)
+            {
+                int idx = _slides.IndexOf(current);
+                if (idx >= 0)
+                    return idx;
+            }
+
+            Vector3 pos = _player.MovementTransform.position;
+            int best = -1;
+            float bestSq = float.MaxValue;
+            for (int i = 0; i < _slides.Count; i++)
+            {
+                var frames = _slides[i] != null ? _slides[i].RideFrames : null;
+                if (frames == null)
+                    continue;
+                for (int f = 0; f < frames.Count; f += 8)
+                {
+                    float d = (frames[f].Position - pos).sqrMagnitude;
+                    if (d < bestSq)
+                    {
+                        bestSq = d;
+                        best = i;
+                    }
+                }
+            }
+
+            return best;
+        }
+
+        void RemoveOldestSlide()
+        {
+            if (_slides.Count == 0)
+                return;
+
+            var slide = _slides[0];
+            _slides.RemoveAt(0);
+            _firstSlideIndex++;
+            if (slide != null)
+                Destroy(slide.gameObject);
+            SlidesVersion++;
+        }
+
         public WaterSlideWater WaterPreset => GetWaterPreset();
 
         WaterSlideWater GetWaterPreset()
@@ -316,6 +496,9 @@ namespace WaterSlides
 
             if (_slides.Count == 0)
             {
+                if (!Application.isPlaying && _preserveSceneLayout && TryAdoptSceneSlides())
+                    return;
+
                 // In Play mode keep slides already built in the scene — regenerating destroys Suimono
                 // surfaces and they often fail to re‑register before the first rendered frame.
                 if (Application.isPlaying && TryAdoptSceneSlides())
@@ -359,8 +542,21 @@ namespace WaterSlides
                 return false;
 
             Array.Sort(existing, CompareSlides);
+
+            // Бесконечная трасса продолжается от сохранённого состояния; если горки в
+            // сцене собраны старой версией кода (состояние не совпадает с набором),
+            // продолжать некуда — честнее пересобрать курс заново.
+            if (Endless && Application.isPlaying && _nextSlideIndex != existing.Length)
+            {
+                Debug.LogWarning($"WaterSlideCourse: горки сцены ({existing.Length}) не совпадают с сохранённым состоянием продолжения ({_nextSlideIndex}) — пересобираю трассу. Перегенерируй курс в редакторе, чтобы это не повторялось.");
+                return false;
+            }
+
             _slides.AddRange(existing);
-            WaterSlideWater.EnsureModuleInScene(transform, GetWaterPreset().SuimonoModulePrefab);
+            _firstSlideIndex = 0;
+            SlidesVersion++;
+            if (Application.isPlaying)
+                WaterSlideWater.EnsureModuleInScene(transform, GetWaterPreset().SuimonoModulePrefab);
             return true;
         }
 
@@ -400,18 +596,44 @@ namespace WaterSlides
             waterPreset.AutoAssignPrefabs();
             WaterSlideWater.EnsureModuleInScene(transform, waterPreset.SuimonoModulePrefab);
 
-            int seed = useRandomSeed
+            _baseSeed = useRandomSeed
                 ? RandomSeed ^ System.Environment.TickCount
                 : RandomSeed;
 
-            var rng = new System.Random(seed);
-            Vector3 cursorPos = transform.position + Vector3.up * 25f;
-            Vector3 pendingEntryDir = Vector3.zero;
-            float pendingCatchLength = 0f;
+            _nextSlideIndex = 0;
+            _firstSlideIndex = 0;
+            _cursorPos = transform.position + Vector3.up * 25f;
+            _pendingEntryDir = Vector3.zero;
+            _pendingCatchLength = 0f;
 
             for (int i = 0; i < SlideCount; i++)
+                AppendNextSlide();
+        }
+
+        // Зерно горки по её номеру: не зависит от того, сколько горок уже построено или
+        // удалено, поэтому трасса одна и та же и в редакторе, и при достройке на ходу.
+        static int SlideSeed(int baseSeed, int index)
+        {
+            unchecked
             {
-                var slideRng = new System.Random(rng.Next());
+                int h = baseSeed * 1000003 + index * 7919 + 12345;
+                h ^= h >> 13;
+                h *= 0x5bd1e995;
+                h ^= h >> 15;
+                return h;
+            }
+        }
+
+        // Строит ОДНУ следующую горку по состоянию продолжения и обновляет его.
+        void AppendNextSlide()
+        {
+            int i = _nextSlideIndex++;
+            var slideRng = new System.Random(SlideSeed(_baseSeed, i));
+            Vector3 cursorPos = _cursorPos;
+            Vector3 pendingEntryDir = _pendingEntryDir;
+            float pendingCatchLength = _pendingCatchLength;
+
+            {
                 var enclosure = PickEnclosure(slideRng, i);
 
                 var loopKinds = PickLoops(slideRng, i);
@@ -444,7 +666,7 @@ namespace WaterSlides
                 // slower exits (normal after braking through a turn) fell short into the
                 // void. Now a slow exit still reaches the entry, and a fast one simply
                 // overflies it and lands a bit further along the slide.
-                bool hasNextJump = i < SlideCount - 1;
+                bool hasNextJump = Endless || i < SlideCount - 1;
                 float jumpForward = 0f, jumpLateral = 0f, jumpStep = 0f;
 
                 // Exit style: up (ski jump), down along the launch (match), or straight.
@@ -518,9 +740,15 @@ namespace WaterSlides
                     i > 0 ? pendingCatchLength : 0f);
 
                 var slide = slideGo.AddComponent<WaterSlideGenerator>();
-                ApplyRandomSlideSettings(slide, enclosure, slideRng);
+                ApplyRandomSlideSettings(slide, enclosure, slideRng, i);
                 slide.Enclosure = enclosure;
                 slide.OpenShape = openShape;
+                // Вариативность стекла (27.10.2026): часть открытых стеклянных —
+                // U-образные с неоном по уголкам; рисунок неона — случайный стиль.
+                if (slide.GlassTube && enclosure == SlideEnclosure.Open && slideRng.NextDouble() < GlassSquareChance)
+                    slide.OpenShape = OpenFlumeShape.Square;
+                if (slide.GlassTube)
+                    slide.GlassLines = PickGlassLineStyle(slideRng);
                 slide.SlideColor = PickSlideColorStable(enclosure, openShape, slideRng);
                 slide.GenerateCollider = GenerateColliders;
                 // The upward lip must survive the mesh builder's descent clamps too.
@@ -530,13 +758,14 @@ namespace WaterSlides
                     slide.BankStrength = 0f;
 
                 var water = slideGo.AddComponent<WaterSlideWater>();
-                ApplyWaterSettings(water, i == SlideCount - 1);
+                ApplyWaterSettings(water, !hasNextJump);
 
                 slide.SetControlPointsLocal(generatedPath.Points);
 
                 _slides.Add(slide);
+                SlidesVersion++;
 
-                if (i < SlideCount - 1)
+                if (hasNextJump)
                 {
                     // Use the ACTUAL rendered end of the slide (the mesh can push it lower than the
                     // raw control point), so the next entrance really sits below the previous exit.
@@ -580,11 +809,136 @@ namespace WaterSlides
                     // exits are unaffected — their flatter arcs still overfly the entry and land
                     // further along the slide, as before.
                     float catchLength = Mathf.Clamp(
-                        Mathf.Sqrt(jumpForward * jumpForward + jumpLateral * jumpLateral) * 0.6f, 3f, 12f);
+                        Mathf.Sqrt(jumpForward * jumpForward + jumpLateral * jumpLateral) * CatchRampFraction, 2f, 12f);
                     pendingCatchLength = catchLength;
                     cursorPos = landing - pendingEntryDir * catchLength;
                 }
             }
+
+            _cursorPos = cursorPos;
+            _pendingEntryDir = pendingEntryDir;
+            _pendingCatchLength = pendingCatchLength;
+        }
+
+        // Пресет под референс (большие парковые горки Planet Coaster 2): широкий
+        // скруглённый жёлоб с цветными полосами, пологие широкие повороты, длинные
+        // горки, бесконечная трасса. Меняет только параметры — перегенерировать отдельно.
+        [ContextMenu("Apply Reference Look (Wide Striped Flume)")]
+        public void ApplyReferenceLook()
+        {
+            Endless = true;
+            SlidesAhead = 3;
+            SlidesBehind = 1;
+
+            SlideLength = new FloatRange { Min = 90f, Max = 130f };
+            SlideDrop = new FloatRange { Min = 25f, Max = 38f };
+            FeaturesPerSlide = new IntRange { Min = 3, Max = 5 };
+            // Радиус поворота должен быть заметно больше половины ширины жёлоба (1.6 м),
+            // иначе внутренняя стенка складывается сама в себя (уточняется ниже).
+            TurnRadius = new FloatRange { Min = 14f, Max = 30f };
+            LoopRadius = new FloatRange { Min = 9f, Max = 14f };
+            LoopChancePerSlide = 0.25f;
+
+            // JumpOffsetX (боковое смещение входа) НЕ трогаем: по правилам игры прыжок
+            // без доворота в воздухе должен иногда промахиваться — попасть на
+            // следующую горку и есть задача игрока.
+
+            // Расчётная скорость вылета — между минимумом езды и потолком игрока
+            // (9 и 19 по пресету игрока): кто сбросил скорость в повороте перед концом
+            // горки — не долетает без газа W; кто летит на потолке — перелетает вход и
+            // садится дальше по горке. Короткая рампа ловли делает недолёт настоящим.
+            AssumedExitSpeed = 15f;
+            CatchRampFraction = 0.3f;
+
+            // Крутые повороты остаются крутыми: на скорости выше √(сцепление·R)
+            // инерция выносит за борт — рулить внутрь и тормозить. Перед таким
+            // поворотом генератор оставляет прямую, где затормозить можно.
+            WidenUnfairTurns = false;
+            TurnRadius = new FloatRange { Min = 7f, Max = 20f };
+            FeaturesPerSlide = new IntRange { Min = 4, Max = 6 };
+
+            // Закрытые трубы выключены по просьбе пользователя (2026-10-26):
+            // «прозрачная не должна быть закрытой» — прозрачными делаются ОТКРЫТЫЕ
+            // жёлобы (GlassOpenChance), закрытые трубы для этого не нужны.
+            AllowClosedTubes = false;
+            // 0.5 давало 4 стеклянных горки из 5 подряд (27.10.2026) — снижено.
+            GlassOpenChance = 0.3f;
+            GlassSquareChance = 0.5f;
+            GlassGridChance = 0.25f;
+            ClosedSlideChance = 0.35f;
+            GlassTubes = true;
+            TubeRadius = new FloatRange { Min = 1.1f, Max = 1.4f };
+            ClosedWallThickness = new FloatRange { Min = 0.05f, Max = 0.08f };
+            OpenFlumeShapeMode = OpenShapeMode.Rounded;
+            ThicknessScale = 1f;
+            // Ширина 2.9–3.3 показалась широкой (26.10.2026) — сужено до 2.2–2.5.
+            FlumeWidth = new FloatRange { Min = 2.2f, Max = 2.5f };
+            FlumeDepth = new FloatRange { Min = 1.1f, Max = 1.3f };
+            FlumeLipHeight = new FloatRange { Min = 0.25f, Max = 0.35f };
+            FlumeCornerRadius = new FloatRange { Min = 0.3f, Max = 0.4f };
+            OpenFlumeWallThickness = new FloatRange { Min = 0.1f, Max = 0.14f };
+            RingSegments = new IntRange { Min = 28, Max = 34 };
+
+            StripedSlides = true;
+            StripeLength = 4f;
+            StripesAlongChance = 0f;
+            MixedPaletteChance = 0.5f;
+            // Палитра референса: синий, голубой, жёлтый, белый, бирюзовый, тёмно-синий, красный.
+            StripeColors = new[]
+            {
+                new Color(0.10f, 0.35f, 0.85f, 1f),
+                new Color(0.40f, 0.72f, 0.95f, 1f),
+                new Color(0.98f, 0.82f, 0.12f, 1f),
+                new Color(0.82f, 0.85f, 0.88f, 1f),
+                new Color(0.20f, 0.78f, 0.72f, 1f),
+                new Color(0.06f, 0.14f, 0.48f, 1f),
+                new Color(0.90f, 0.16f, 0.12f, 1f)
+            };
+
+            // На широком дне тонкий слой воды: при прежней доле глубина воды была бы
+            // ~30 см и ноги тонули бы в ленте.
+            var water = GetWaterPreset();
+            // Явно: 26.10.2026 диагностический опыт выключил воду через пресет, строку
+            // убрали, а сериализованное false осталось и жило в сцене до 27.10.
+            water.EnableWater = true;
+            water.WaterFill = 0.12f;
+            // Лента воды на 90% ширины жёлоба: за пределами плоской хорды она
+            // ложится тонкой плёнкой по эллиптическим стенкам (BuildWaterSurface).
+            water.MinWaterWidth = 0.9f;
+            water.EnableTransparency = true;
+            water.WaterTransparency = 0.35f;
+            water.SuimonoTransRenderDistance = 60f;
+
+            // Вода как на референсе: быстрый тонкий поток ВДОЛЬ жёлоба, мелкие
+            // вытянутые по течению струи, белая пена, светлая мелкая вода.
+            water.FlowAlignment = WaterFlowAlignment.AlongSlide;
+            water.FlowDirectionOffset = 0f;
+            water.FlowSpeed = 1.6f;
+            water.WaveHeight = 0.05f;
+            water.WaveScale = 1.5f;
+            water.WaveStretchAlong = 0.5f;
+            water.WaveStretchAcross = 6f;
+            water.OverrideLook = true;
+            water.FoamAmount = 0.9f;
+            water.FoamScale = 0.25f;
+            water.ShallowColor = new Color(0.7f, 0.92f, 1f, 1f);
+            water.DepthColor = new Color(0.15f, 0.55f, 0.9f, 1f);
+        }
+
+        // Своя палитра полос для каждой горки: один базовый цвет из общей палитры
+        // (по кругу — соседние горки всегда разного цвета) плюс его светлый и тёмный
+        // оттенки и белый. Горки читаются как «синяя», «жёлтая», «бирюзовая»…
+        Color[] BuildSlideStripePalette(int slideIndex)
+        {
+            if (StripeColors == null || StripeColors.Length == 0)
+                return null;
+
+            Color baseColor = StripeColors[((slideIndex % StripeColors.Length) + StripeColors.Length) % StripeColors.Length];
+            Color light = Color.Lerp(baseColor, Color.white, 0.35f);
+            Color dark = Color.Lerp(baseColor, Color.black, 0.35f);
+            // Не чисто белый: под солнцем силой 4.5 белая полоса выгорала в пятно.
+            var white = new Color(0.82f, 0.85f, 0.88f, 1f);
+            return new[] { baseColor, light, white, dark, baseColor };
         }
 
         static Vector3 ComputeFirstSlideEntryDirection(Vector3 courseForward, float maxTiltDegrees, System.Random rng)
@@ -648,13 +1002,43 @@ namespace WaterSlides
             }
         }
 
-        void ApplyRandomSlideSettings(WaterSlideGenerator slide, SlideEnclosure enclosure, System.Random rng)
+        void ApplyRandomSlideSettings(WaterSlideGenerator slide, SlideEnclosure enclosure, System.Random rng, int slideIndex)
         {
             float scale = Mathf.Max(ThicknessScale, 0.05f);
 
             slide.RingSegments = RingSegments.Sample(rng);
             slide.SamplesPerSegment = SamplesPerSegment.Sample(rng);
             slide.BankStrength = enclosure == SlideEnclosure.Open ? 0f : BankStrength.Sample(rng);
+
+            slide.Striped = StripedSlides && enclosure == SlideEnclosure.Open;
+            slide.StripesAlong = rng.NextDouble() < StripesAlongChance;
+            slide.StripeLanes = StripeLanes.Sample(rng);
+            // Смешанная палитра (вся) либо оттенки одного базового цвета — чтобы
+            // горки различались цветом; продольные дорожки всегда из всей палитры.
+            bool mixed = slide.StripesAlong || rng.NextDouble() < MixedPaletteChance;
+            slide.StripeColors = mixed && StripeColors != null
+                ? (Color[])StripeColors.Clone()
+                : BuildSlideStripePalette(slideIndex);
+            slide.StripeLength = StripeLength;
+            slide.StripeSeed = rng.Next();
+
+            slide.BoostStripCount = BoostStripsPerSlide.Sample(rng);
+            slide.BoostStripLength = BoostStripLength;
+            slide.BoostSeed = rng.Next();
+            slide.BoostStripMaterial = BoostStripMaterial;
+
+            // Стекло: все закрытые трубы и часть открытых жёлобов (GlassOpenChance).
+            slide.GlassTube = GlassTubes && (enclosure == SlideEnclosure.Closed || rng.NextDouble() < GlassOpenChance);
+            slide.TubeRingSpacing = TubeRingSpacing.Sample(rng);
+            bool clearGlass = rng.NextDouble() < GlassClearChance;
+            slide.GlassTint = clearGlass
+                ? new Color(0.92f, 0.96f, 1f, Mathf.Min(GlassOpacity, 0.1f))
+                : new Color(0.75f, 0.9f, 1f, GlassOpacity);
+            slide.GlassNeon = GlassNeonColors != null && GlassNeonColors.Length > 0
+                ? GlassNeonColors[rng.Next(GlassNeonColors.Length)]
+                : Color.clear;
+            if (slide.GlassTube && (slide.StripeColors == null || slide.StripeColors.Length == 0))
+                slide.StripeColors = StripeColors != null ? (Color[])StripeColors.Clone() : null;
 
             if (enclosure == SlideEnclosure.Closed)
             {
@@ -684,6 +1068,8 @@ namespace WaterSlides
             }
 
             _slides.Clear();
+            _firstSlideIndex = 0;
+            SlidesVersion++;
         }
 
         GeneratedSlidePath BuildSlidePathWorld(
@@ -709,6 +1095,7 @@ namespace WaterSlides
                 MinFeatures = FeaturesPerSlide.Min,
                 MaxFeatures = FeaturesPerSlide.Max,
                 AllowLoops = AllowLoopsAndSpirals && enclosure == SlideEnclosure.Closed,
+                WidenUnfairTurns = WidenUnfairTurns,
                 Enclosure = enclosure,
                 // Chained: the short post-jump run PLUS the catch-ramp extension — the slide
                 // was started up the jump chord by exactly that much (see Build), so the ramp
@@ -793,6 +1180,18 @@ namespace WaterSlides
             if (palette == null || palette.Length == 0)
                 return fallback;
             return palette[rng.Next(palette.Length)];
+        }
+
+        GlassLineStyle PickGlassLineStyle(System.Random rng)
+        {
+            if (rng.NextDouble() < GlassGridChance)
+                return GlassLineStyle.Grid;
+            return rng.Next(3) switch
+            {
+                0 => GlassLineStyle.EdgesOnly,
+                1 => GlassLineStyle.RingsOnly,
+                _ => GlassLineStyle.EdgesAndRings
+            };
         }
 
         OpenFlumeShape PickOpenShape(System.Random rng)

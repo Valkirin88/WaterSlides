@@ -13,6 +13,14 @@ public class SlideContactDrops : MonoBehaviour
     [SerializeField] float _fullRateSpeed = 12f;
     [Tooltip("Удержание эмиссии после потери контакта, сек. На швах и гребнях контакт пропадает на много физических шагов подряд (см. PlayerView), поэтому меньше ~0.3 — и капли гаснут прямо во время езды; в полёте они гаснут за это же время.")]
     [SerializeField] float _contactGrace = 0.35f;
+    [Tooltip("Скорость разлёта брызг НАЗАД от направления движения тела, м/с (мировые оси, задаётся модулем Velocity over Lifetime).")]
+    [SerializeField] float _backSpeed = 4f;
+    [Tooltip("Скорость разлёта брызг ВВЕРХ по нормали горки, м/с.")]
+    [SerializeField] float _upSpeed = 4f;
+    [Tooltip("Сдвиг источника брызг от точки касания горки ВДОЛЬ движения, м: 0 — ровно под центром тела, минус — ближе к хвосту (голове), плюс — к ногам.")]
+    [SerializeField] float _sourceAlongOffset = -0.2f;
+    [Tooltip("Подъём источника над точкой касания по нормали горки, м: чуть выше поверхности, чтобы капли не рождались под водой горки.")]
+    [SerializeField] float _sourceLift = 0.05f;
 
     PlayerView _view;
     Rigidbody _body;
@@ -57,8 +65,41 @@ public class SlideContactDrops : MonoBehaviour
             return;
         }
 
-        float speed = _body.linearVelocity.magnitude;
+        Vector3 velocity = _body.linearVelocity;
+        float speed = velocity.magnitude;
         SetEmission(Mathf.Clamp01((speed - _minSpeed) / Mathf.Max(_fullRateSpeed - _minSpeed, 0.1f)));
+
+        // Брызги летят НАЗАД от реального движения тела (ось +Z систем частиц смотрит
+        // против скорости, «вверх» — по нормали горки); конус в инспекторе лишь
+        // приподнимает веер. Ориентация по трансформу персонажа была ненадёжна —
+        // брызги вылетали перед телом.
+        if (speed > 1f)
+        {
+            Vector3 up = _view.SlideNormal;
+            if (up.sqrMagnitude < 0.25f || Mathf.Abs(Vector3.Dot(up.normalized, velocity / speed)) > 0.95f)
+                up = Vector3.up;
+            up.Normalize();
+            Vector3 back = -velocity / speed;
+            // Скорость частиц задаётся явно в МИРОВЫХ осях (назад и вверх от движения):
+            // не зависит ни от ориентации трансформа, ни от конуса.
+            Vector3 drift = back * _backSpeed + up * _upSpeed;
+            var rotation = Quaternion.LookRotation(back, up);
+            // Источник — точка касания горки под телом (низ капсулы), а не локальный
+            // сдвиг объекта Drops в иерархии: пивот Player стоит у ног, и любой
+            // фиксированный сдвиг давал брызги впереди/позади тела в зависимости от позы.
+            Vector3 along = Vector3.ProjectOnPlane(velocity / speed, up).normalized;
+            Vector3 source = _view.SlideContactPoint + along * _sourceAlongOffset + up * _sourceLift;
+            for (int i = 0; i < _systems.Length; i++)
+            {
+                _systems[i].transform.SetPositionAndRotation(source, rotation);
+                var vel = _systems[i].velocityOverLifetime;
+                vel.enabled = true;
+                vel.space = ParticleSystemSimulationSpace.World;
+                vel.x = drift.x;
+                vel.y = drift.y;
+                vel.z = drift.z;
+            }
+        }
     }
 
     void SetEmission(float scale)

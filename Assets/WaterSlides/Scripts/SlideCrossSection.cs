@@ -63,7 +63,14 @@ namespace WaterSlides
             {
                 float u = (t - 0.19f) / 0.31f;
                 float x = Mathf.Lerp(-halfW + r, halfW - r, u);
-                float crown = Mathf.Cos(u * Mathf.PI) * d * 0.035f;
+                // Symmetric shallow dip, zero at BOTH corner junctions (the corner arcs
+                // end exactly at y = -d). The former cos(u·π) is monotonic over u∈[0..1]
+                // (+1 → −1): it tilted the whole floor left-high/right-low (~2°) and left
+                // ~1 cm ledges where the floor met the corner arcs — every fresh landing
+                // (assist ramp still zero, nothing recentring yet) slid the body towards
+                // the right wall, and the capsule rode the junction ledges half-on-half-off.
+                // The dip instead self-centres a landed body on the channel axis.
+                float crown = -Mathf.Sin(u * Mathf.PI) * d * 0.035f;
                 return new Vector2(x, -d + crown);
             }
 

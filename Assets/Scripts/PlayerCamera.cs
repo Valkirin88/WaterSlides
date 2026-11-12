@@ -11,10 +11,18 @@ public class PlayerCamera : MonoBehaviour
     [SerializeField] float _pitch = 25f;
     [Tooltip("Сглаживание поворота камеры за игроком, сек (0 — без сглаживания).")]
     [SerializeField] float _yawSmoothTime = 0.12f;
+    [Tooltip("На езде камера смотрит вдоль ЖЁЛОБА: поворот берётся из касательной пути на столько метров впереди тела (камера заранее входит в виражи и не глядит поперёк жёлоба, когда тело лезет на стенку). 0 — поворот по телу, как в полёте.")]
+    [SerializeField] float _rideLookAhead = 6f;
     [Tooltip("Сглаживание позиции слежения на горке, сек — гасит физическую микротряску тела при контакте, не отставая от реального движения (0 — без сглаживания).")]
     [SerializeField] float _positionSmoothTime = 0.08f;
     [Tooltip("Сглаживание позиции слежения в ПОЛЁТЕ, сек. В воздухе тело чисто баллистическое (контактной микротряски нет), поэтому сильное сглаживание тут только копит отставание при разгоне падения и усиливает дрожание камеры за быстрой целью — держи малым. 0 — камера жёстко держит интерполированное тело.")]
     [SerializeField] float _flightPositionSmoothTime = 0.015f;
+
+    [Header("Lean")]
+    [Tooltip("Крен камеры, градусов, когда тело у самой стенки жёлоба (руль-ползунок): камера наклоняется в сторону стенки, чтобы положение в жёлобе читалось. 0 — без крена.")]
+    [SerializeField] float _lateralRollDegrees = 7f;
+    [Tooltip("Сглаживание крена, с.")]
+    [SerializeField] float _rollSmoothTime = 0.18f;
 
     [Header("Occlusion")]
     [Tooltip("Слои, коллайдеры которых заслоняют игрока: если между игроком и камерой есть такой коллайдер (обычно меш горки на спуске), камера подтягивается ближе к игроку. Триггеры и коллайдеры самого игрока игнорируются.")]
@@ -53,6 +61,8 @@ public class PlayerCamera : MonoBehaviour
     Camera _camera;
     Rigidbody _targetBody;
     PlayerView _targetView;
+    float _roll;
+    float _rollVelocity;
     SpeedRushEffect _speedRush;
     float _shakeStrength;
     float _yaw;
@@ -70,6 +80,29 @@ public class PlayerCamera : MonoBehaviour
     float _extraPitchVelocity;
     float _blockedRun;
     float _hardBlockedRun;
+    // Smoothed lateral shift of the camera hang point towards the flume centreline
+    // (world-space vector) — see the centre-bias block in LateUpdate.
+    Vector3 _centerBias;
+    Vector3 _centerBiasVelocity;
+    // The point the camera offset actually hangs from this frame: the smoothed follow
+    // point plus the centre bias. Sight rays still target the PLAYER (GetSightAnchor
+    // stays on _followPoint) — only the camera end of the segment moves.
+    Vector3 _cameraBasePoint;
+    // Smoothed rim-clamp lift (m along the last rim normal) — see the clamp block.
+    float _rimLift;
+    float _rimLiftVelocity;
+    Vector3 _lastRimUp = Vector3.up;
+
+    // How fast the rim-clamp lift eases back out once the plane stops demanding it
+    // (real departure from the course, bank levelling off). Rising is instant.
+    const float RimLiftReleaseTime = 0.35f;
+
+    // Centre-bias limits: how far (m) the camera hang point may shift towards the
+    // flume spine, and how softly the shift follows the body's lateral position.
+    // MaxCenterBias ≈ the channel half-width — enough to bring the camera fully over
+    // the interior from either wall; the smoothing keeps wall-to-wall swings gentle.
+    const float MaxCenterBias = 0.6f;
+    const float CenterBiasSmoothTime = 0.25f;
 
     // Minimum CONSECUTIVE blocked time, s, before either occlusion response (the pitch
     // raise or the hard distance clamp) reacts. Touchdowns and mesh seams produce
@@ -210,6 +243,15 @@ public class PlayerCamera : MonoBehaviour
         // camera visibly wandered sideways exactly when the slide got steep. When the
         // projection is too short to trust, hold the current yaw instead of chasing it.
         Vector3 flatForward = Vector3.ProjectOnPlane(_target.forward, Vector3.up);
+        // На горке — вдоль жёлоба впереди, а не по телу (которое на стенке и в
+        // заносе смотрит куда угодно).
+        if (_rideLookAhead > 0f && _targetView != null
+            && _targetView.TryGetRideAheadTangent(_rideLookAhead, out Vector3 aheadTangent))
+        {
+            Vector3 flatAhead = Vector3.ProjectOnPlane(aheadTangent, Vector3.up);
+            if (flatAhead.sqrMagnitude > 0.0225f)
+                flatForward = flatAhead;
+        }
         float targetYaw = flatForward.sqrMagnitude > 0.0225f
             ? Mathf.Atan2(flatForward.x, flatForward.z) * Mathf.Rad2Deg
             : (_yawInitialized ? _yaw : _target.eulerAngles.y);
@@ -234,14 +276,18 @@ public class PlayerCamera : MonoBehaviour
         // into visible judder. Ease the smooth-time down for flight and back up on
         // landing — easing the value itself (not switching it) lets SmoothDamp catch up
         // without a pop at take-off.
-        float targetSmoothTime = (_targetView != null && !_targetView.IsOnSlide)
+        // Подскок с перегиба — не полёт: сглаживание езды остаётся (иначе за 0.1 с
+        // подскока оно почти выключалось и рывки пристёгивания шли прямо в камеру).
+        float targetSmoothTime = (_targetView != null && !_targetView.IsOnSlide && !_targetView.IsAirborneHopNearSlide)
             ? _flightPositionSmoothTime
             : _positionSmoothTime;
         _activePositionSmoothTime = _followInitialized
             ? Mathf.MoveTowards(_activePositionSmoothTime, targetSmoothTime, 0.5f * Time.deltaTime)
             : targetSmoothTime;
 
-        Vector3 targetPoint = _target.position;
+        // Следим за ЦЕНТРОМ тела, не за пивотом у ног: разворот тела на перегибе
+        // (нос вниз на 30°) двигал пивот на полметра по дуге — камера дёргалась.
+        Vector3 targetPoint = _targetView != null ? _targetView.BodyCenter : _target.position;
         if (!_followInitialized || _activePositionSmoothTime <= 0f)
         {
             _followPoint = targetPoint;
@@ -252,6 +298,30 @@ public class PlayerCamera : MonoBehaviour
         {
             _followPoint = Vector3.SmoothDamp(_followPoint, targetPoint, ref _followVelocity, _activePositionSmoothTime);
         }
+
+        // CENTRE BIAS: while the body rides pressed against a flume wall, a camera
+        // hanging straight behind it hangs over/behind that wall — the sight line to
+        // the player clears the LIP (so no occlusion ray reacts) while the frame
+        // fills with the shell's back faces, or the clearance sphere catches the lip
+        // and steps the camera in towards the player for no visible reason. Shift
+        // the hang point towards the channel spine instead: over the interior the
+        // view stays clear at full distance. The player drifts off-centre in frame
+        // towards the wall he hugs — honest, readable framing. Smoothed as a vector,
+        // so losing the guide (jumps, flights) just eases the bias back out.
+        Vector3 biasTarget = Vector3.zero;
+        if (_targetView != null
+            && _targetView.TryGetFlumeCenterline(out Vector3 spinePoint, out Vector3 spineTangent, out Vector3 spineUp))
+        {
+            Vector3 spineRight = Vector3.Cross(spineUp, spineTangent);
+            if (spineRight.sqrMagnitude > 1e-4f)
+            {
+                spineRight.Normalize();
+                float lateral = Vector3.Dot(_followPoint - spinePoint, spineRight);
+                biasTarget = spineRight * Mathf.Clamp(-lateral, -MaxCenterBias, MaxCenterBias);
+            }
+        }
+        _centerBias = Vector3.SmoothDamp(_centerBias, biasTarget, ref _centerBiasVelocity, CenterBiasSmoothTime);
+        _cameraBasePoint = _followPoint + _centerBias;
 
         // On a steep descent the fixed-pitch offset lands on the far side of the slide
         // mesh. Before falling back to pulling the camera in, try STEEPENING the view:
@@ -270,28 +340,56 @@ public class PlayerCamera : MonoBehaviour
             ? neededExtraPitch
             : Mathf.SmoothDamp(_extraPitch, neededExtraPitch, ref _extraPitchVelocity, pitchSmoothTime);
 
+        // Крен по поперечному положению в жёлобе: у правой стенки камера кренится
+        // вправо (горизонт уходит влево-вверх), как при наклоне тела в вираже.
+        float rollTarget = 0f;
+        if (_targetView != null && _targetView.IsOnSlide && _targetView.CurrentSlide != null)
+        {
+            float halfWidth = Mathf.Max(_targetView.CurrentSlide.RideHalfWidth, 0.1f);
+            rollTarget = -Mathf.Clamp(_targetView.RideLateral / halfWidth, -1f, 1f) * _lateralRollDegrees;
+        }
+        _roll = _rollSmoothTime > 0f
+            ? Mathf.SmoothDamp(_roll, rollTarget, ref _rollVelocity, _rollSmoothTime)
+            : rollTarget;
+
+        // Крен только в самой ориентации камеры, не в смещении: иначе кренился бы
+        // и отступ камеры от игрока.
         var rotation = Quaternion.Euler(_pitch + _extraPitch, _yaw, 0f);
         Vector3 cameraOffset = rotation * _offset;
+        rotation = Quaternion.Euler(_pitch + _extraPitch, _yaw, _roll);
         float distance = ResolveOcclusionDistance(cameraOffset);
         float fullDistance = cameraOffset.magnitude;
         Vector3 position = fullDistance > 0.001f
-            ? _followPoint + cameraOffset * (distance / fullDistance)
-            : _followPoint;
+            ? _cameraBasePoint + cameraOffset * (distance / fullDistance)
+            : _cameraBasePoint;
 
         // HARD rim clamp on the POSITION, every frame. The pitch raise above is
         // SMOOTHED (rise ~0.18 s) while the channel frame in a corner banks faster —
         // in that window the camera transiently sinks below the rim plane; the
         // distance pull-in can also drag it down along the offset line after the
-        // pitch check passed. Lift the final position along the rim normal instead:
-        // the lift is a continuous function of the violation depth (starts at zero),
-        // so there is no pop, and it fades out by itself as the smoothed pitch
-        // catches up. Higher is always safer than behind the shell.
+        // pitch check passed. Lift the final position along the rim normal instead.
+        // The lift RISES instantly (protection: higher is always safer than behind
+        // the shell) but DECAYS smoothly: when the plane vanishes (real departure
+        // from the course — a flyout, a jump into the void) a one-frame release
+        // dropped the camera to the falling body in a visible snap.
+        float rimLiftTarget = 0f;
         if (_targetView != null && _targetView.TryGetFlumeRimPlane(out Vector3 rimPlanePoint, out Vector3 rimPlaneUp))
         {
+            _lastRimUp = rimPlaneUp;
             float rimHeight = Vector3.Dot(position - rimPlanePoint, rimPlaneUp);
-            if (rimHeight < RimClearance)
-                position += rimPlaneUp * (RimClearance - rimHeight);
+            rimLiftTarget = Mathf.Max(0f, RimClearance - rimHeight);
         }
+        if (rimLiftTarget >= _rimLift)
+        {
+            _rimLift = rimLiftTarget;
+            _rimLiftVelocity = 0f;
+        }
+        else
+        {
+            _rimLift = Mathf.SmoothDamp(_rimLift, rimLiftTarget, ref _rimLiftVelocity, RimLiftReleaseTime);
+        }
+        if (_rimLift > 1e-4f && _lastRimUp.sqrMagnitude > 0.25f)
+            position += _lastRimUp * _rimLift;
 
         transform.SetPositionAndRotation(position, rotation);
         ApplySpeedShake(rotation);
@@ -318,7 +416,7 @@ public class PlayerCamera : MonoBehaviour
     // face to exactly one of the two rays.
     bool SightBlocked(Vector3 cameraOffset)
     {
-        Vector3 camEnd = _followPoint + cameraOffset;
+        Vector3 camEnd = _cameraBasePoint + cameraOffset;
         Vector3 anchor = GetSightAnchor();
         Vector3 sightVec = camEnd - anchor;
         float sightLen = sightVec.magnitude;
@@ -353,16 +451,22 @@ public class PlayerCamera : MonoBehaviour
 
     // PROACTIVE pitch raise on descents — the primary mechanism for "look down at the
     // player on a steep slope". It works from the player's VELOCITY direction alone:
-    // no raycasts, no one-sided-collider blind spots, no confirm windows, and — key —
-    // NO contact gating: on a really steep drop the player spends half the time in
-    // micro-hops next to the surface, and an IsOnSlide-gated version switched off
-    // exactly where it was needed most. A steep ballistic fall gets the same top-down
-    // view, which is what the descent visually is. _extraPitch smoothing (rise/recover
-    // times) keeps the changes soft. The occlusion search below remains as a safety
-    // net for geometry this term can't predict.
+    // no raycasts, no one-sided-collider blind spots, no confirm windows. The contact
+    // gate is SOFT: plain IsOnSlide flickers off in the micro-hops of a rough steep
+    // descent — exactly where the raise is needed most — so the near-slide hop state
+    // counts as riding. Only a REAL flight (a jump or launch away from the current
+    // slide) returns 0: an ungated version treated the steep ballistic arc as a
+    // descent too, and on every jump the camera climbed overhead to a top-down view —
+    // "goes up and away" right at the landing on the next slide. _extraPitch
+    // smoothing (rise/recover times) keeps both the raise and the flight release
+    // soft. The occlusion search below remains as a safety net for geometry this
+    // term can't predict.
     float ResolveSlopeExtraPitch()
     {
         if (_slopePitchMargin < 0f || _targetBody == null)
+            return 0f;
+
+        if (_targetView != null && !_targetView.IsOnSlide && !_targetView.IsAirborneHopNearSlide)
             return 0f;
 
         Vector3 velocity = _targetBody.linearVelocity;
@@ -406,7 +510,7 @@ public class PlayerCamera : MonoBehaviour
 
         for (float extra = 0f; extra < maxExtra; extra += 3f)
         {
-            Vector3 pos = _followPoint + Quaternion.Euler(_pitch + extra, _yaw, 0f) * _offset;
+            Vector3 pos = _cameraBasePoint + Quaternion.Euler(_pitch + extra, _yaw, 0f) * _offset;
             if (Vector3.Dot(pos - rimPoint, rimUp) >= RimClearance)
                 return extra;
         }
@@ -485,7 +589,7 @@ public class PlayerCamera : MonoBehaviour
             // Hit distances live on that segment; the camera is clamped at the same
             // FRACTION of its own offset line — the two lines share the far endpoint,
             // so the mapping is exact where it matters.
-            Vector3 camEnd = _followPoint + cameraOffset;
+            Vector3 camEnd = _cameraBasePoint + cameraOffset;
             Vector3 anchor = GetSightAnchor();
             Vector3 sightVec = camEnd - anchor;
             float sightLen = sightVec.magnitude;
@@ -543,7 +647,7 @@ public class PlayerCamera : MonoBehaviour
                     float overlapAllowed = Mathf.Min(hardAllowed, fullDistance);
                     for (int i = 0; i < 12 && overlapAllowed > HardClampFloor; i++)
                     {
-                        Vector3 candidate = _followPoint + offsetDir * overlapAllowed;
+                        Vector3 candidate = _cameraBasePoint + offsetDir * overlapAllowed;
                         if (!CameraSphereOverlaps(candidate, playerRoot)
                             && !UnderSlideRoof(candidate, playerRoot))
                             break;
@@ -623,7 +727,7 @@ public class PlayerCamera : MonoBehaviour
 
         // Riding effect only. A free fall quickly exceeds the speed threshold too, and
         // the full-strength tremble there read as the camera following jerkily.
-        if (_targetView != null && !_targetView.IsOnSlide)
+        if (_targetView != null && !_targetView.IsOnSlide && !_targetView.IsAirborneHopNearSlide)
             target = 0f;
         _shakeStrength = Mathf.MoveTowards(_shakeStrength, target, 3f * Time.deltaTime);
         if (_shakeStrength <= 0.001f)
@@ -646,6 +750,10 @@ public class PlayerCamera : MonoBehaviour
         _hardBlockedRun = 0f;
         _extraPitch = 0f;
         _extraPitchVelocity = 0f;
+        _centerBias = Vector3.zero;
+        _centerBiasVelocity = Vector3.zero;
+        _rimLift = 0f;
+        _rimLiftVelocity = 0f;
         ResolveTargetBody();
         if (_speedRush != null)
             _speedRush.SetTargetBody(_targetBody);

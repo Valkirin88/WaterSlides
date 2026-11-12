@@ -236,9 +236,13 @@ namespace WaterSlides
             int segmentCount = isOpen ? ringVerts - 1 : ringVerts;
             var frames = BuildFrames(segmentPath, settings);
 
+            // UV.y — длина дуги в МЕТРАХ (не 0..1): так полосы раскраски имеют
+            // одинаковую длину на любой горке, а текстура не растягивается по длине.
+            var ringDistance = BuildRingDistances(segmentPath);
+
             for (int ring = 0; ring < rings; ring++)
             {
-                float v = ring / (float)(rings - 1);
+                float v = ringDistance[ring];
                 var frame = frames[ring];
 
                 for (int seg = 0; seg < ringVerts; seg++)
@@ -281,26 +285,71 @@ namespace WaterSlides
                 }
             }
 
-            AddWallThicknessCaps(vertices, normals, uvs, triangles, vertexBase, rings, ringVerts, isOpen);
+            AddWallThicknessCaps(vertices, normals, uvs, triangles, vertexBase, rings, ringVerts, isOpen, ringDistance);
+        }
+
+        static float[] BuildRingDistances(List<Vector3> path)
+        {
+            var result = new float[path.Count];
+            float total = 0f;
+            for (int i = 1; i < path.Count; i++)
+            {
+                total += Vector3.Distance(path[i - 1], path[i]);
+                result[i] = total;
+            }
+
+            return result;
         }
 
         // A thin water ribbon sitting at a fill level inside the tube/flume, following the path.
         // UV.x = width in meters (0..surface width), UV.y = distance along path in meters.
-        public static Mesh BuildWaterSurface(IReadOnlyList<Vector3> controlPoints, Settings settings, float fillFraction)
+        public static Mesh BuildWaterSurface(IReadOnlyList<Vector3> controlPoints, Settings settings, float fillFraction, float minWidthFraction = 0f)
         {
             var path = BuildProcessedPath(controlPoints, settings);
             if (path.Count < 2)
                 return null;
 
-            ComputeWaterChord(settings, Mathf.Clamp01(fillFraction), out float waterY, out float halfChord);
+            ComputeWaterChord(settings, Mathf.Clamp01(fillFraction), out float waterY, out float halfChord, minWidthFraction);
             if (halfChord <= 0.001f)
                 return null;
+
+            // Профиль ленты поперёк: плоское зеркало на высоте waterY, а там, где
+            // лента шире естественной хорды (MinWaterWidth), — тонкая плёнка по
+            // эллиптической стенке открытого Rounded-жёлоба (его профиль —
+            // x = cos·halfW, y = sin·d, см. SlideCrossSection.SampleOpenRounded).
+            // Раньше лишняя ширина просто пряталась под стенкой, и видимая вода
+            // оставалась узкой хордой (при WaterFill 0.12 — меньше половины жёлоба).
+            bool sheetOnWalls = settings.Enclosure == SlideEnclosure.Open
+                && settings.OpenFlume.Shape == OpenFlumeShape.Rounded;
+            const float film = 0.02f;
+            int across = sheetOnWalls ? 11 : 2;
+            var profile = new Vector2[across];
+            var profileNormal = new Vector2[across];
+            for (int j = 0; j < across; j++)
+            {
+                float x = Mathf.Lerp(-halfChord, halfChord, j / (float)(across - 1));
+                float y = waterY;
+                var n = new Vector2(0f, 1f);
+                if (sheetOnWalls)
+                {
+                    float halfW = settings.OpenFlume.Width * 0.5f;
+                    float d = settings.OpenFlume.Depth;
+                    float k = Mathf.Clamp01(1f - (x * x) / Mathf.Max(halfW * halfW, 1e-6f));
+                    float wallY = -d * Mathf.Sqrt(k) + film;
+                    if (wallY > y)
+                    {
+                        y = wallY;
+                        n = new Vector2(-x / (halfW * halfW), Mathf.Sqrt(k) / d).normalized;
+                    }
+                }
+                profile[j] = new Vector2(x, y);
+                profileNormal[j] = n;
+            }
 
             var vertices = new List<Vector3>();
             var normals = new List<Vector3>();
             var uvs = new List<Vector2>();
             var triangles = new List<int>();
-            float surfaceWidth = halfChord * 2f;
             float vAccum = 0f;
 
             var frames = BuildFrames(path, settings);
@@ -311,21 +360,21 @@ namespace WaterSlides
                 if (ring > 0)
                     vAccum += Vector3.Distance(frame.Position, frames[ring - 1].Position);
 
-                vertices.Add(ToWorld(frame, new Vector2(-halfChord, waterY)));
-                normals.Add(frame.Up);
-                uvs.Add(new Vector2(0f, vAccum));
-
-                vertices.Add(ToWorld(frame, new Vector2(halfChord, waterY)));
-                normals.Add(frame.Up);
-                uvs.Add(new Vector2(surfaceWidth, vAccum));
+                for (int j = 0; j < across; j++)
+                {
+                    vertices.Add(ToWorld(frame, profile[j]));
+                    normals.Add(ToWorldNormal(frame, profileNormal[j]));
+                    uvs.Add(new Vector2(profile[j].x + halfChord, vAccum));
+                }
             }
 
             for (int ring = 0; ring < path.Count - 1; ring++)
+            for (int j = 0; j < across - 1; j++)
             {
-                int i0 = ring * 2;
-                int i1 = ring * 2 + 1;
-                int i2 = (ring + 1) * 2;
-                int i3 = (ring + 1) * 2 + 1;
+                int i0 = ring * across + j;
+                int i1 = i0 + 1;
+                int i2 = (ring + 1) * across + j;
+                int i3 = i2 + 1;
                 AddQuad(triangles, i0, i2, i3, i1);
             }
 
@@ -404,7 +453,7 @@ namespace WaterSlides
         }
 
         // Water surface height (local Y, along frame Up) and half-width of the surface at that height.
-        public static void ComputeWaterChord(Settings settings, float fill, out float waterY, out float halfChord)
+        public static void ComputeWaterChord(Settings settings, float fill, out float waterY, out float halfChord, float minWidthFraction = 0f)
         {
             if (settings.Enclosure == SlideEnclosure.Open)
             {
@@ -421,6 +470,9 @@ namespace WaterSlides
                 {
                     halfChord = halfW * 0.92f;
                 }
+
+                // Лента шире хорды: лишнее уходит под стенки жёлоба и там не видно.
+                halfChord = Mathf.Max(halfChord, halfW * Mathf.Clamp01(minWidthFraction));
             }
             else
             {
@@ -546,9 +598,16 @@ namespace WaterSlides
             var frame = frames[startIndex];
             forward = frame.Forward.sqrMagnitude > 1e-6f ? frame.Forward.normalized : Vector3.forward;
 
-            // t=0.5 is the BOTTOM of the closed-tube ring (t=0.25 was its side wall).
+            // The lateral CENTRE of the floor, per profile: the spawn must sit exactly on
+            // the channel axis or the very first landing starts with a sideways slide.
+            //  * Square: the floor branch spans normalized t 0.19..0.5, its middle is
+            //    t=0.345 (x=0 by construction);
+            //  * Rounded: the elliptical trough bottom is at normalized t=0.5 — the old
+            //    0.345 landed ~0.6·halfW LEFT of the axis on rounded first slides;
+            //  * closed tube: t=0.5 is the bottom of the ring (t=0.25 was its side wall).
             float floorT = settings.Enclosure == SlideEnclosure.Open
-                ? 0.345f * SlideCrossSection.OpenProfileMaxT
+                ? (settings.OpenFlume.Shape == OpenFlumeShape.Square ? 0.345f : 0.5f)
+                    * SlideCrossSection.OpenProfileMaxT
                 : 0.5f;
 
             SampleCrossSection(settings, floorT, outer: false, out var profile, out _);
@@ -729,7 +788,8 @@ namespace WaterSlides
             int vertexBase,
             int rings,
             int ringVerts,
-            bool isOpen)
+            bool isOpen,
+            float[] ringDistance)
         {
             int segmentCount = isOpen ? ringVerts - 1 : ringVerts;
 
@@ -737,7 +797,7 @@ namespace WaterSlides
             for (int e = 0; e < 2; e++)
             {
                 int ring = e == 0 ? 0 : rings - 1;
-                float v = ring / (float)(rings - 1);
+                float v = ringDistance[ring];
                 for (int seg = 0; seg < segmentCount; seg++)
                 {
                     int next = isOpen ? seg + 1 : (seg + 1) % ringVerts;
@@ -759,7 +819,7 @@ namespace WaterSlides
             // of the left (seg 0) and right (seg ringVerts-1) lips.
             for (int ring = 0; ring < rings - 1; ring++)
             {
-                float v = ring / (float)(rings - 1);
+                float v = ringDistance[ring];
                 for (int k = 0; k < 2; k++)
                 {
                     int seg = k == 0 ? 0 : ringVerts - 1;

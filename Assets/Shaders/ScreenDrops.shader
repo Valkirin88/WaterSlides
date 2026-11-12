@@ -25,6 +25,7 @@ Shader "Hidden/WaterSlides/ScreenDrops"
             float _Refract;   // uv shift under a drop
             float _Slide;     // accumulated downward crawl
             float2 _Offset;   // random per-trigger pattern offset
+            float _FineLayer; // weight of the second, finer drops layer (0 — only large drops)
 
             fixed4 frag (v2f_img i) : SV_Target
             {
@@ -33,7 +34,7 @@ Shader "Hidden/WaterSlides/ScreenDrops"
 
                 float m1 = tex2D(_DropsTex, duv + _Offset + float2(0.0, _Slide)).r;
                 float m2 = tex2D(_DropsTex, duv * 1.63 + _Offset.yx + float2(0.0, _Slide * 0.55)).r;
-                float m = saturate(max(m1, m2 * 0.85)) * _Strength;
+                float m = saturate(max(m1, m2 * _FineLayer)) * _Strength;
 
                 fixed4 col = tex2D(_MainTex, i.uv + m * _Refract);
                 // Slight darkening so the drops read even against bright water.

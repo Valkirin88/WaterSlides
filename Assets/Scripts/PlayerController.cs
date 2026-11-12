@@ -29,6 +29,7 @@ public class PlayerController
         if (course.Slides.Count > 0)
             _playerView.SetGuideSlide(course.Slides[0]);
         _airJumpUsed = false;
+        _inputController.ResetLateralTarget();
     }
 
     public void OnSlideContact()
@@ -39,29 +40,40 @@ public class PlayerController
     public void FixedUpdate()
     {
         var input = _inputController.Current;
-        _playerView.SetSlideSteerInput(_playerView.IsOnSlide ? input.TurnAxis : 0f);
+        if (input.JumpPressed)
+            _inputController.ConsumeJump();
+        // На горке: палец/клавиши задают ЦЕЛЕВОЕ поперечное положение (ползунок);
+        // без цели (ввод зонда автотестов) — старый руль по оси.
+        if (_playerView.IsOnSlide && input.HasLateralTarget)
+        {
+            _playerView.SetSlideLateralTarget(input.LateralTarget, true);
+            _playerView.SetSlideSteerInput(0f);
+        }
+        else
+        {
+            _playerView.SetSlideLateralTarget(0f, false);
+            _playerView.SetSlideSteerInput(_playerView.IsOnSlide ? input.TurnAxis : 0f);
+        }
         _playerView.SetThrottleInput(input.ThrottleAxis);
 
-        // W/S work everywhere — on the slide and mid-flight.
-        ApplyThrottle(input.ThrottleAxis);
-
+        // While riding, the path model inside PlayerView consumes W/S/A/D itself;
+        // the controller only triggers the jump. Airborne, the free-physics air
+        // controls below apply.
         if (_playerView.IsOnSlide)
-            ApplySlideMovement(input);
-        // Flight controls only in a REAL flight — the body has left the channel (or
-        // jumped deliberately). During a short hop still over the slide (a seam
-        // bounce, a scramble onto the wall lip with A/D held) the strafe used to fire
-        // at full air acceleration the moment the contact flickered and shoved the
-        // body off the lip — read as the slide kicking the player out. Such hops are
-        // now purely ballistic; space during a hop still jumps like from the slide.
-        else if (!_playerView.IsAirborneHopNearSlide)
-            ApplyAirMovement(input);
-        else if (input.JumpPressed)
-            JumpOffSlide();
+        {
+            if (input.JumpPressed)
+                _playerView.TryJumpFromSlide();
+            return;
+        }
+
+        ApplyAirThrottle(input.ThrottleAxis);
+        ApplyAirMovement(input);
     }
 
-    // W accelerates along the current motion, S bleeds speed off. Acceleration respects
-    // the slide speed cap; braking only shaves speed and never pushes the body backwards.
-    void ApplyThrottle(float axis)
+    // W accelerates along the current motion, S bleeds speed off — mid-flight only
+    // (the ride model handles both on the slide). Acceleration respects the speed
+    // cap; braking only shaves speed and never pushes the body backwards.
+    void ApplyAirThrottle(float axis)
     {
         if (Mathf.Abs(axis) < 0.01f)
             return;
@@ -71,8 +83,7 @@ public class PlayerController
         float speed = velocity.magnitude;
 
         // Through the view so mid-flight W/S accelerate the ragdoll bones along with the
-        // capsule (no doll swing); while riding the doll is inactive and this is plain
-        // AddForce on the capsule.
+        // capsule (no doll swing).
         if (axis > 0f)
         {
             Vector3 dir = speed > 0.5f ? velocity / speed : _playerView.MovementTransform.forward;
@@ -85,65 +96,19 @@ public class PlayerController
         }
     }
 
-    void ApplySlideMovement(InputController.State input)
-    {
-        ApplySlideSteer(input.TurnAxis);
-
-        if (input.JumpPressed)
-            JumpOffSlide();
-    }
-
-    // A/D while riding move the body to the LEFT/RIGHT edge of the slide (across the
-    // flow; in a closed tube — around the bore). The guide assist releases the lateral
-    // axis while this input is held (PlayerView.steerFree), otherwise it would eat the
-    // sideways speed as fast as this force builds it.
-    //
-    // In an OPEN flume the push goes along the channel's lateral axis (the guide frame
-    // right), NOT along the surface tangent: on the wall the tangent points UP the slope,
-    // and merely holding the key slowly drove the body over the lip. The frame-right
-    // force presses INTO the wall instead, and the lateral speed this force may build is
-    // capped below the wall-escape speed — holding A/D parks the body against the wall,
-    // while going OVER the wall takes real sideways inertia built up at speed. The cap
-    // only gates this force and never clamps the velocity, so that inertia is untouched.
-    void ApplySlideSteer(float axis)
-    {
-        if (Mathf.Abs(axis) < 0.01f)
-            return;
-
-        var rb = _playerView.Rigidbody;
-
-        if (_playerView.TryGetOpenFlumeSteerAxis(out Vector3 flumeRight))
-        {
-            if (axis * Vector3.Dot(rb.linearVelocity, flumeRight) < Settings.MaxSlideSteerSpeed)
-                rb.AddForce(flumeRight * (axis * Settings.SlideSteerForce), ForceMode.Acceleration);
-            return;
-        }
-
-        // Closed tube (or riding without a guide): push across the flow along the
-        // surface tangent — it swings the body around the bore.
-        Vector3 normal = _playerView.SlideNormal;
-        Vector3 forward = Vector3.ProjectOnPlane(rb.linearVelocity, normal);
-        if (forward.sqrMagnitude < 0.25f)
-            forward = Vector3.ProjectOnPlane(_playerView.MovementTransform.forward, normal);
-        if (forward.sqrMagnitude < 1e-4f)
-            return;
-
-        Vector3 right = Vector3.Cross(normal, forward.normalized);
-        if (right.sqrMagnitude < 1e-6f)
-            return;
-
-        rb.AddForce(right.normalized * (axis * Settings.SlideSteerForce), ForceMode.Acceleration);
-    }
-
     void ApplyAirMovement(InputController.State input)
     {
         var rb = _playerView.Rigidbody;
 
+        // No steering during the initial drop after a spawn/teleport: A/D could shift
+        // the fall off the first slide before the ride has even begun. Unlocks on the
+        // first slide contact (the flag also resets on every respawn teleport).
+        float turnAxis = _playerView.HasSlideContactSinceSpawn ? input.TurnAxis : 0f;
+
         // The strafe axis comes from the FLIGHT HEADING frozen at launch, not from the
         // body or the velocity: pushing from the body heading still let each strafe
-        // permanently bend the flight (the yaw then chased the bent velocity and the
-        // whole flight turned). Anchored to the constant heading, A/D shifts the arc
-        // sideways while the view and the forward flight stay put — движение, не поворот.
+        // permanently bend the flight. Anchored to the constant heading, A/D shifts
+        // the arc sideways while the view and the forward flight stay put.
         Vector3 heading = _playerView.FlightHeading;
         if (heading.sqrMagnitude < 1e-4f)
             heading = Vector3.forward;
@@ -152,14 +117,14 @@ public class PlayerController
         Vector3 velocity = rb.linearVelocity;
         float lateral = Vector3.Dot(velocity, right);
 
-        if (Mathf.Abs(input.TurnAxis) > 0.01f)
+        if (Mathf.Abs(turnAxis) > 0.01f)
         {
             // Through the view, not rb.AddForce: the acceleration must reach the flight
-            // ragdoll's bones too, or the visible body lags the capsule (see PlayerView).
-            _playerView.AddAirControlAcceleration(right * (input.TurnAxis * Settings.AirStrafeAcceleration));
+            // ragdoll's bones too, or the visible body lags the capsule.
+            _playerView.AddAirControlAcceleration(right * (turnAxis * Settings.AirStrafeAcceleration));
 
-            // Cap only the LATERAL component: clamping the whole horizontal velocity (as
-            // before) dropped the forward flight speed to the strafe limit mid-jump.
+            // Cap only the LATERAL component: clamping the whole horizontal velocity
+            // dropped the forward flight speed to the strafe limit mid-jump.
             float maxLateral = Settings.MaxAirStrafeSpeed;
             if (Mathf.Abs(lateral) > maxLateral)
             {
@@ -171,8 +136,7 @@ public class PlayerController
         {
             // Key released: bleed the sideways speed off so the shift STOPS and the
             // flight continues along the original heading instead of drifting
-            // diagonally into the landing. Clamped so the last step never overshoots
-            // and rocks the body back and forth around zero.
+            // diagonally into the landing.
             float decel = Mathf.Min(Settings.AirStrafeDamping, Mathf.Abs(lateral) / Time.fixedDeltaTime);
             _playerView.AddAirControlAcceleration(right * (-Mathf.Sign(lateral) * decel));
         }
@@ -181,19 +145,8 @@ public class PlayerController
         {
             rb.AddForce(Vector3.up * Settings.AirJumpForce, ForceMode.VelocityChange);
             _playerView.SuppressGuidance();
+            _playerView.NotifyAirJump();
             _airJumpUsed = true;
         }
-    }
-
-    void JumpOffSlide()
-    {
-        var rb = _playerView.Rigidbody;
-        Vector3 normal = _playerView.SlideNormal;
-        Vector3 jumpDir = (normal + Vector3.up * 0.65f).normalized;
-        Vector3 alongSlide = Vector3.ProjectOnPlane(rb.linearVelocity, normal);
-        rb.linearVelocity = alongSlide + jumpDir * Settings.SlideJumpForce;
-        _playerView.ResetSlideContacts();
-        _playerView.SuppressGuidance();
-        _airJumpUsed = false;
     }
 }

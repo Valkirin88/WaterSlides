@@ -2,9 +2,9 @@ using System.Collections.Generic;
 using UnityEngine;
 
 // Visual ragdoll: the root capsule keeps doing all the real flying/riding under player
-// control, while the humanoid model goes limp — the bones get physics and the HEAD stays
-// a KINEMATIC anchor driven along the capsule's pose, so the doll dangles off its head
-// and is dragged along, flailing from the neck down. The capsule is FULLY isolated from
+// control, while the humanoid model goes limp — the bones get physics and hang off a
+// separate KINEMATIC neck anchor driven along the capsule's pose, so the doll dangles by
+// the neck and is dragged along, flailing (head included). The capsule is FULLY isolated from
 // the doll BY CONSTRUCTION: no joint references the capsule and the bones ignore the
 // capsule/slide colliders, so nothing the doll does can ever affect the ride or camera.
 // _alwaysRagdoll (default ON): limp for the whole run, ride included — on the slide the
@@ -13,8 +13,14 @@ using UnityEngine;
 // real flight between slides.
 // The bone bodies/colliders are built procedurally from the humanoid rig — no Ragdoll
 // Wizard setup needed. Lives on the Player object; disable the component to turn it off.
+// Порядок 10: LateUpdate куклы (сборка по первой позе, смешивание снимка) идёт ПОСЛЕ
+// PlayerView.LateUpdate, который разворачивает позу через таз (_hipsPoseEuler).
+[DefaultExecutionOrder(10)]
 public class PlayerFlightRagdoll : MonoBehaviour
 {
+    // Кукла жива (кости у физики): PlayerView в это время не трогает таз.
+    public bool IsActive => _active;
+
     [Tooltip("Рэгдол в ПОЛЁТЕ: в настоящем полёте между горками кукла обмякает и болтается от шеи вниз. Выкл — в полёте продолжает играть анимация (аниматор). Можно переключать прямо в Play Mode: при выключении в воздухе кукла сразу возвращается к анимации. На режим «рэгдол всегда» не влияет.")]
     [SerializeField] bool _flightRagdoll = true;
     [Tooltip("Задержка после отрыва от горки, сек — короткие подскоки на швах и гребнях не включают ragdoll.")]
@@ -23,6 +29,8 @@ public class PlayerFlightRagdoll : MonoBehaviour
     [SerializeField] float _blendDuration = 0.25f;
     [Tooltip("Свобода суставов конечностей, градусы.")]
     [SerializeField, Range(10f, 120f)] float _limbSwingLimit = 80f;
+    [Tooltip("Свобода головы относительно груди в рэгдоле, градусы. Кукла висит за ШЕЮ на отдельном кинематическом якоре, который едет с капсулой, а голова болтается на шейном суставе в этих пределах (до 28.10.2026 голова сама была якорем и стояла жёстко). 0 — голова почти не качается.")]
+    [SerializeField, Range(0f, 90f)] float _headSwingLimit = 45f;
     [Tooltip("Жёсткость возврата суставов к исходной позе. 0 — полностью свободная тряпка. Исходная поза — кадр единственной анимации Flying (руки в стороны), поэтому большая жёсткость заставляет руки торчать; держи её малой, чтобы конечности свисали под гравитацией.")]
     [SerializeField] float _poseSpring = 1.5f;
     [Tooltip("Случайный начальный взмах конечностей при переходе в ragdoll, рад/с.")]
@@ -52,10 +60,13 @@ public class PlayerFlightRagdoll : MonoBehaviour
     readonly List<Part> _parts = new();
     Part _hipsPart;
     Part _headPart;
-    // The head's weld pose relative to the capsule, captured at activation: the head is
-    // a KINEMATIC anchor driven to this pose every step (see DriveHeadAnchor).
-    Vector3 _headLocalPosition;
-    Quaternion _headLocalRotation = Quaternion.identity;
+    // The doll's anchor: a separate KINEMATIC body at the neck (the head bone's pivot),
+    // driven to the capsule's pose every step (see DriveAnchor). The chest hangs off it
+    // by a joint at the neck point; the head itself is a free dynamic part on the chest.
+    Rigidbody _anchorBody;
+    // The anchor's weld pose relative to the capsule, captured at activation.
+    Vector3 _anchorLocalPosition;
+    Quaternion _anchorLocalRotation = Quaternion.identity;
 
     bool _built;
     bool _active;
@@ -157,7 +168,10 @@ public class PlayerFlightRagdoll : MonoBehaviour
         else if (!_view.IsOnSlide)
         {
             _airTime += Time.fixedDeltaTime;
-            if (!_active && _airTime >= _activationDelay)
+            // Подскок с перегиба над своей же горкой — не полёт (IsAirborneHopNearSlide):
+            // кукла там не обмякает; настоящий отрыв (прыжок, вылет, сход с конца)
+            // включает рэгдол через _activationDelay, посадка выключает (ветка ниже).
+            if (!_active && !_view.IsAirborneHopNearSlide && _airTime >= _activationDelay)
                 Activate();
         }
         else
@@ -169,7 +183,7 @@ public class PlayerFlightRagdoll : MonoBehaviour
 
         if (_active)
         {
-            DriveHeadAnchor();
+            DriveAnchor();
             ApplyVirtualFloor();
         }
     }
@@ -307,21 +321,16 @@ public class PlayerFlightRagdoll : MonoBehaviour
         for (int i = 0; i < _parts.Count; i++)
         {
             var body = _parts[i].Body;
-            // The HEAD stays KINEMATIC: it is the doll's anchor, driven to the capsule's
-            // pose every step (DriveHeadAnchor). The neck joint hangs the dynamic chest
-            // off this kinematic body, so the chain solver sees an immovable anchor and
-            // NO joint references the capsule at all — the doll's влияние on the capsule
-            // is exactly zero by construction, not merely damped. (The previous scheme —
-            // a dynamic head welded to the capsule by a ConfigurableJoint with a big
+            // Every bone goes dynamic, the head included. The doll hangs off the separate
+            // KINEMATIC neck anchor (_anchorBody, driven to the capsule's pose every step
+            // in DriveAnchor): the chain solver sees an immovable anchor and NO joint
+            // references the capsule at all — the doll's influence on the capsule is
+            // exactly zero by construction, not merely damped. (The old scheme — a dynamic
+            // head welded to the capsule by a ConfigurableJoint with a big
             // connectedMassScale — kept a real solver coupling: resonant doll motion,
             // e.g. the early too-stiff virtual floor, leaked through it and could throw
-            // the capsule upward.)
-            if (_parts[i] == _headPart)
-            {
-                body.interpolation = RigidbodyInterpolation.Interpolate;
-                continue;
-            }
-
+            // the capsule upward. The scheme before this one kept the HEAD kinematic as
+            // the anchor — isolated, but the head stood rigid while the body flailed.)
             body.isKinematic = false;
             // Interpolate only while the doll is LIVE. The capsule root (and the camera
             // following it) renders interpolated; bones stepped raw at the fixed rate
@@ -338,11 +347,15 @@ public class PlayerFlightRagdoll : MonoBehaviour
                 : Vector3.zero;
         }
 
-        // Weld pose of the head on the capsule — captured from the animated pose at the
-        // moment of activation, so the head keeps riding exactly where the animator had it.
+        // The anchor is placed at the neck of the animated pose at the moment of
+        // activation (the head bone's pivot, where the chest joint expects it) and its
+        // weld pose on the capsule is captured, so the doll keeps hanging exactly where
+        // the animator had the neck.
+        _anchorBody.position = _headPart.Body.position;
+        _anchorBody.rotation = _headPart.Body.rotation;
         Quaternion inverseRoot = Quaternion.Inverse(_rootBody.rotation);
-        _headLocalPosition = inverseRoot * (_headPart.Body.position - _rootBody.position);
-        _headLocalRotation = inverseRoot * _headPart.Body.rotation;
+        _anchorLocalPosition = inverseRoot * (_anchorBody.position - _rootBody.position);
+        _anchorLocalRotation = inverseRoot * _anchorBody.rotation;
 
         // No hips tether: it existed for the abandoned permanent-ragdoll-on-slide mode
         // (without slide collisions the body sank through the floor there). In flight
@@ -350,14 +363,13 @@ public class PlayerFlightRagdoll : MonoBehaviour
         // by the WAIST — the body must hang and trail from the head anchor alone.
     }
 
-    // The kinematic head follows the capsule rigidly. MovePosition/MoveRotation (not a
-    // transform write): the physics engine then gives the kinematic body the proper
-    // implicit velocity, which the neck joint and the interpolation both need.
-    void DriveHeadAnchor()
+    // The kinematic neck anchor follows the capsule rigidly. MovePosition/MoveRotation
+    // (not a transform write): the physics engine then gives the kinematic body the
+    // proper implicit velocity, which the chest joint and the interpolation both need.
+    void DriveAnchor()
     {
-        var body = _headPart.Body;
-        body.MovePosition(_rootBody.position + _rootBody.rotation * _headLocalPosition);
-        body.MoveRotation(_rootBody.rotation * _headLocalRotation);
+        _anchorBody.MovePosition(_rootBody.position + _rootBody.rotation * _anchorLocalPosition);
+        _anchorBody.MoveRotation(_rootBody.rotation * _anchorLocalRotation);
     }
 
     // Equal-acceleration forwarding for the air control (strafe, strafe damping, extra
@@ -452,9 +464,27 @@ public class PlayerFlightRagdoll : MonoBehaviour
         AddCapsule(chestPart, head.position, 0.12f * s);
         Connect(chestPart, _hipsPart, 25f);
 
+        // Якорь куклы: отдельное кинематическое тело без коллайдера в точке шеи (пивот
+        // кости головы), в полёте ведётся по позе капсулы (DriveAnchor). Грудь подвешена
+        // к нему суставом в точке шеи — кукла висит за шею, как раньше висела за голову,
+        // но голова теперь свободная кость на шейном суставе (_headSwingLimit) и
+        // болтается вместе с телом. Ни один сустав не ссылается на капсулу.
+        // (Часть процедурной сборки куклы — исключение из правила «без AddComponent».)
+        var anchorObject = new GameObject("RagdollNeckAnchor");
+        anchorObject.transform.SetParent(transform, false);
+        anchorObject.transform.SetPositionAndRotation(head.position, head.rotation);
+        _anchorBody = anchorObject.AddComponent<Rigidbody>();
+        _anchorBody.isKinematic = true;
+        _anchorBody.useGravity = false;
+        _anchorBody.interpolation = RigidbodyInterpolation.Interpolate;
+        var neckJoint = CreateJoint(chestPart.Body, _anchorBody, 40f);
+        neckJoint.autoConfigureConnectedAnchor = false;
+        neckJoint.anchor = chest.InverseTransformPoint(head.position);
+        neckJoint.connectedAnchor = Vector3.zero;
+
         _headPart = CreatePart(head, 0.5f);
         AddHeadSphere(_headPart, chest, 0.11f * s);
-        Connect(_headPart, chestPart, 40f);
+        Connect(_headPart, chestPart, _headSwingLimit);
 
         CreateLimb(chestPart, HumanBodyBones.LeftUpperArm, HumanBodyBones.LeftLowerArm, HumanBodyBones.LeftHand, 0.055f * s, 0.045f * s, 0.35f, 0.25f);
         CreateLimb(chestPart, HumanBodyBones.RightUpperArm, HumanBodyBones.RightLowerArm, HumanBodyBones.RightHand, 0.055f * s, 0.045f * s, 0.35f, 0.25f);
@@ -464,7 +494,7 @@ public class PlayerFlightRagdoll : MonoBehaviour
         // Bones DO collide with each other (only adjacent connected pairs are ignored, in
         // Connect — they overlap at the joint by construction). Non-adjacent limb contacts
         // are kept so the doll flails naturally. None of it can reach the capsule: the
-        // doll hangs off the KINEMATIC head anchor (see Activate/DriveHeadAnchor) and no
+        // doll hangs off the KINEMATIC neck anchor (see Activate/DriveAnchor) and no
         // joint references the capsule, so bone dynamics never nudge its speed or path.
 
         // The bone colliders live inside the player capsule; contacts against it would

@@ -159,3 +159,18 @@ x86/
 
 # Built Visual Studio Code Extensions
 *.vsix
+# Служебные файлы моста автотестов и локальные бэкапы
+AgentBridge/*.png
+AgentBridge/*.jpg
+AgentBridge/run_*.csv
+AgentBridge/run_*_events.txt
+AgentBridge/bridge_error.txt
+AgentBridge/menu_result.txt
+Backups/
+
+# Аварийные копии сцен Unity и служебные файлы моста автотестов
+/[Aa]ssets/_Recovery/
+/[Aa]ssets/_Recovery.meta
+AgentBridge/editor-start.log
+AgentBridge/focus_result.txt
+AgentBridge/panorama-tiles/*.png

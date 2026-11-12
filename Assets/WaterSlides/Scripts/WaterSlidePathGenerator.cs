@@ -57,6 +57,11 @@ namespace WaterSlides
         public float BrakeDeceleration; // торможение игрока (S), м/с²
         public float GravityAccel;      // эффективная гравитация игрока, м/с²
         public float EntrySpeed;        // расчётная скорость на входе в горку, м/с
+        // true — «нечестный» поворот расширяется под скорость подхода (старое поведение,
+        // крутых поворотов на быстрой трассе почти не остаётся); false — радиус остаётся
+        // крутым, перед поворотом лишь вставляется прямая, на которой игрок МОЖЕТ
+        // затормозить сам (не тормозит — вылетает).
+        public bool WidenUnfairTurns;
     }
 
     public struct GeneratedSlidePath
@@ -653,13 +658,18 @@ namespace WaterSlides
             if (vMid <= vAllowed)
                 return radius;
 
-            float radiusCap = Mathf.Max(settings.TurnRadiusMax * 1.4f, radius);
-            float radiusFit = vMid * vMid / (grip * 0.85f);
-            if (radiusFit <= radiusCap)
-                return Mathf.Max(radius, radiusFit);
+            if (settings.WidenUnfairTurns)
+            {
+                float radiusCap = Mathf.Max(settings.TurnRadiusMax * 1.4f, radius);
+                float radiusFit = vMid * vMid / (grip * 0.85f);
+                if (radiusFit <= radiusCap)
+                    return Mathf.Max(radius, radiusFit);
 
-            radius = radiusCap;
-            vAllowed = Mathf.Sqrt(grip * radius) * 0.95f;
+                radius = radiusCap;
+                vAllowed = Mathf.Sqrt(grip * radius) * 0.95f;
+            }
+
+            // Радиус остаётся; прямая перед поворотом даёт игроку место затормозить.
             float brakeLength = (vMid * vMid - vAllowed * vAllowed) / (2f * settings.BrakeDeceleration);
             brakeLength = Mathf.Clamp(brakeLength * 1.2f + 2f, 3f, 30f);
             // Gentle slope on the braking run: it must keep descending (the monotonic

@@ -18,7 +18,9 @@ public class FlightScreenDrops : MonoBehaviour
     [Tooltip("Плотность капель: больше — мельче капли, меньше — крупнее (1.6 ≈ крупные капли).")]
     [SerializeField] float _tiles = 1.6f;
     [Tooltip("Сила линзирования под каплей. При укрупнении капель (меньше Tiles) поднимай вместе: растянутая маска даёт более пологие градиенты, и без компенсации крупные капли выглядят плоско.")]
-    [SerializeField, Range(0f, 0.08f)] float _refraction = 0.04f;
+    [SerializeField, Range(0f, 0.12f)] float _refraction = 0.04f;
+    [Tooltip("Вес второго, мелкого слоя капель (0–1). Шейдер кладёт два слоя маски: крупный и в 1.63 раза мельче; чем меньше вес, тем меньше мелких капель на экране и тем реже они в целом. 0 — только крупные.")]
+    [SerializeField, Range(0f, 1f)] float _fineLayer = 0.85f;
     [Tooltip("Скорость сползания капель вниз по экрану.")]
     [SerializeField] float _slideSpeed = 0.05f;
 
@@ -107,6 +109,7 @@ public class FlightScreenDrops : MonoBehaviour
         _material.SetFloat("_Refract", _refraction);
         _material.SetFloat("_Slide", _slide);
         _material.SetVector("_Offset", _offset);
+        _material.SetFloat("_FineLayer", _fineLayer);
         Graphics.Blit(source, destination, _material);
     }
 

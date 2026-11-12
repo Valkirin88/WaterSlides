@@ -13,6 +13,8 @@ public class EntryPoint : MonoBehaviour
     [SerializeField] float _spawnHeightAboveStart = 2.5f;
     [Tooltip("Сколько кадров ждать готовности трассы к спавну, прежде чем создать игрока принудительно.")]
     [SerializeField] int _maxWaitFrames = 300;
+    [Tooltip("Игра начинается заново, когда тело в полёте столько секунд ПОДРЯД не имеет шанса попасть ни на одну горку (баллистический прогноз PlayerView.CanStillReachSlide, проверка 4 раза в секунду). Пока горка под телом есть — падение продолжается, сколько бы ни длилось.")]
+    [SerializeField] float _unreachableConfirmTime = 1.5f;
 
     InputController _inputController;
     PlayerController _playerController;
@@ -20,6 +22,15 @@ public class EntryPoint : MonoBehaviour
     // Lowest ride point of the whole course minus a margin; falling below it means the
     // player left the course for good (tunnelled through a mesh or flew into the void).
     float _fallRespawnY = float.NegativeInfinity;
+    // «Безнадёжное падение»: тело в полёте и баллистический прогноз не находит ни
+    // одной горки, на которую ещё можно упасть (с запасом на A/D). Прежний критерий
+    // «2 с быстрее −20 м/с» рестартовал и те падения, под которыми горка ЕСТЬ
+    // (длинный спуск к горке далеко внизу), и не ловил медленные промахи.
+    float _unreachableTimer;
+    float _reachCheckTimer;
+    bool _reachable = true;
+    // Версия набора горок курса, для которой посчитана сетка высоты.
+    int _cachedSlidesVersion = -1;
 
     void Awake()
     {
@@ -88,17 +99,63 @@ public class EntryPoint : MonoBehaviour
         if (!_spawned || _playerView == null)
             return;
 
+        // Бесконечная трасса: набор горок меняется на ходу, сетка высоты следует за ним.
+        if (_course != null && _course.SlidesVersion != _cachedSlidesVersion)
+            CacheFallRespawnHeight();
+
+        // Безнадёжное падение: в полёте дольше 0.4 с (короткие подскоки с перегибов
+        // не считаются), тело идёт вниз, и прогноз не находит горки, на которую ещё
+        // можно упасть, — подряд _unreachableConfirmTime секунд. До первого касания
+        // после спавна не проверяется (спавн-падение страхует сетка высоты ниже).
+        var rb = _playerView.Rigidbody;
+        bool falling = rb != null && !_playerView.IsOnSlide && _playerView.HasSlideContactSinceSpawn
+            && _playerView.TimeSinceSlideContact > 0.4f && rb.linearVelocity.y < 0f;
+        if (falling)
+        {
+            _reachCheckTimer -= Time.deltaTime;
+            if (_reachCheckTimer <= 0f)
+            {
+                _reachCheckTimer = 0.25f;
+                _reachable = _playerView.CanStillReachSlide();
+            }
+            if (_reachable)
+                _unreachableTimer = 0f;
+            else
+                _unreachableTimer += Time.deltaTime;
+        }
+        else
+        {
+            _unreachableTimer = 0f;
+            _reachCheckTimer = 0f;
+            _reachable = true;
+        }
+
         Vector3 pos = _playerView.MovementTransform.position;
-        if (pos.y >= _fallRespawnY)
+        bool belowCourse = pos.y < _fallRespawnY;
+        if (!belowCourse && _unreachableTimer < _unreachableConfirmTime)
             return;
 
-        Debug.LogWarning($"EntryPoint: игрок упал ниже трассы (y={pos.y:F1} < {_fallRespawnY:F1}) в позиции {pos} — возвращаю на старт. Если это происходит сразу после появления, значит тело прошло сквозь коллайдер первой горки — сообщи об этом.");
+        _unreachableTimer = 0f;
+        _reachable = true;
+        if (_playerController == null)
+        {
+            if (_playerView == null || _course == null)
+                return;
+
+            _inputController ??= new InputController();
+            _playerController = new PlayerController(_playerView, _inputController);
+        }
+
+        Debug.LogWarning(belowCourse
+            ? $"EntryPoint: игрок упал ниже трассы (y={pos.y:F1} < {_fallRespawnY:F1}) в позиции {pos} — возвращаю на старт. Если это происходит сразу после появления, значит тело прошло сквозь коллайдер первой горки — сообщи об этом."
+            : $"EntryPoint: безнадёжное падение (под телом нет горки {_unreachableConfirmTime:F2} с) в позиции {pos} — игра начинается заново.");
         _playerController.SpawnAboveFirstSlide(_course, _spawnHeightAboveStart, _playerView.SpawnBodyClearance);
         _playerView.BeginPlay();
     }
 
     void CacheFallRespawnHeight()
     {
+        _cachedSlidesVersion = _course.SlidesVersion;
         float minY = float.MaxValue;
         foreach (var slide in _course.Slides)
         {

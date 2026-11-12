@@ -34,6 +34,13 @@ namespace WaterSlides
         [Tooltip("Уровень заполнения: 0 — дно, 1 — почти полная труба.")]
         [Range(0.1f, 0.95f)] public float WaterFill = 0.194f;
 
+        [Tooltip("Минимальная ширина ленты воды как доля ширины жёлоба (0 — только геометрическая хорда на уровне заполнения). Лента шире хорды уходит под стенки и там не видна.")]
+        [Range(0f, 1f)] public float MinWaterWidth = 0f;
+
+        // Полуширина ленты воды (хорда на уровне заполнения, не уже MinWaterWidth ×
+        // полуширины жёлоба), м. Читают крылья пены: сторона тела вне воды — без крыла.
+        public float WaterHalfWidth { get; private set; }
+
         [Tooltip("Скорость течения (Suimono flowSpeed).")]
         [Range(0.01f, 2f)] public float FlowSpeed = 0.469f;
 
@@ -60,6 +67,36 @@ namespace WaterSlides
         [Tooltip("Растяжение волн ПОПЕРЁК горки (больше = мельче/чаще поперёк).")]
         [Min(0.1f)] public float WaveStretchAcross = 15f;
 
+        [Header("Transparency")]
+        [Tooltip("Прозрачность воды Suimono: сцена за поверхностью рисуется отдельной камерой (дороже на кадр). Выкл — вода непрозрачная.")]
+        public bool EnableTransparency = true;
+
+        [Tooltip("Доля собственного цвета воды поверх того, что под ней: 0 — полностью прозрачная, 1 — непрозрачная.")]
+        [Range(0f, 1f)] public float WaterTransparency = 0.35f;
+
+        [Header("Custom Shader")]
+        [Tooltip("Рисовать ленту воды своим шейдером WaterSlides/SlideWater (струи, пена, рябь; дёшево) вместо поверхности Suimono.")]
+        public bool UseCustomShader = false;
+
+        [Tooltip("Материал на шейдере WaterSlides/SlideWater (Assets/WaterSlides/Environment/SlideWater.mat). Если пусто — создаётся из шейдера.")]
+        public Material CustomWaterMaterial;
+
+        [Header("Look — Foam & Color")]
+        [Tooltip("Пена Suimono на ленте воды (0 — выкл, 1 — максимум): белые струи и пена на мелкой быстрой воде, как на настоящих горках.")]
+        [Range(0f, 1f)] public float FoamAmount = 0f;
+
+        [Tooltip("Масштаб пятен пены (0 — крупные, 1 — мелкие).")]
+        [Range(0f, 1f)] public float FoamScale = 0.3f;
+
+        [Tooltip("Цвет мелкой воды (у ленты на дне жёлоба — почти вся вода мелкая).")]
+        public Color ShallowColor = new(0.55f, 0.85f, 1f, 1f);
+
+        [Tooltip("Цвет глубокой воды.")]
+        public Color DepthColor = new(0.1f, 0.5f, 0.85f, 1f);
+
+        [Tooltip("Применять цвета ShallowColor/DepthColor и пену поверх пресета Suimono (выкл — как в пресете).")]
+        public bool OverrideLook = false;
+
         [Header("Waterfall")]
         [Tooltip("Эффект водопада Suimono на выходе трубы.")]
         public bool EnableWaterfall = true;
@@ -75,7 +112,7 @@ namespace WaterSlides
         public GameObject WaterfallEffectPrefab;
 
         [Header("Suimono — Close Range")]
-        [Tooltip("Резерв для transRenderDistance, если снова включить прозрачность Suimono. На горках прозрачность отключена — вода рисуется напрямую.")]
+        [Tooltip("Дальность (м), на которой прозрачность Suimono работает: ближе — видно дно и горку сквозь воду, дальше — вода рисуется своим цветом. Камера-помощник Suimono рендерит сцену до этой дальности.")]
         [Min(3f)] public float SuimonoTransRenderDistance = 8f;
 
         const float DefaultSuimonoTransRenderDistance = 8f;
@@ -99,6 +136,7 @@ namespace WaterSlides
         {
             target.EnableWater = true;
             target.WaterFill = 0.194f;
+            target.MinWaterWidth = 0f;
             target.FlowSpeed = 0.469f;
             target.WaveHeight = 0.152f;
             target.WaveScale = 4.7f;
@@ -108,6 +146,11 @@ namespace WaterSlides
             target.WaveStretchAlong = 0.1f;
             target.WaveStretchAcross = 15f;
             target.EnableWaterfall = true;
+            target.FoamAmount = 0f;
+            target.FoamScale = 0.3f;
+            target.OverrideLook = false;
+            target.EnableTransparency = true;
+            target.WaterTransparency = 0.35f;
             target.SuimonoTransRenderDistance = DefaultSuimonoTransRenderDistance;
         }
 
@@ -138,6 +181,8 @@ namespace WaterSlides
             if (!Application.isPlaying || !IsSlideWater)
                 return;
 
+            if (UseCustomShader)
+                return;
             EnsureSuimonoSurface();
             StartCoroutine(RefreshSuimonoWhenReady());
         }
@@ -221,13 +266,13 @@ namespace WaterSlides
             // Slide water is viewed from centimeters away. Suimono's transparency RT path
             // (enableTransparency + transRenderDistance) fades the surface to the trans buffer
             // up close — on thin ribbon meshes that buffer is empty and water disappears.
-            module.enableTransparency = false;
+            module.enableTransparency = preset != null && preset.EnableTransparency;
             module.enableCaustics = false;
 
             float transDistance = preset != null
                 ? preset.SuimonoTransRenderDistance
                 : DefaultSuimonoTransRenderDistance;
-            module.transRenderDistance = Mathf.Clamp(transDistance, 3f, 50f);
+            module.transRenderDistance = Mathf.Clamp(transDistance, 3f, 300f);
 
             DisableScreenRenderingHelperCameras(module);
         }
@@ -293,6 +338,7 @@ namespace WaterSlides
 
             EnableWater = source.EnableWater;
             WaterFill = source.WaterFill;
+            MinWaterWidth = source.MinWaterWidth;
             FlowSpeed = source.FlowSpeed;
             WaveHeight = source.WaveHeight;
             WaveScale = source.WaveScale;
@@ -302,6 +348,15 @@ namespace WaterSlides
             WaveStretchAlong = source.WaveStretchAlong;
             WaveStretchAcross = source.WaveStretchAcross;
             EnableWaterfall = source.EnableWaterfall;
+            UseCustomShader = source.UseCustomShader;
+            CustomWaterMaterial = source.CustomWaterMaterial;
+            FoamAmount = source.FoamAmount;
+            FoamScale = source.FoamScale;
+            ShallowColor = source.ShallowColor;
+            DepthColor = source.DepthColor;
+            OverrideLook = source.OverrideLook;
+            EnableTransparency = source.EnableTransparency;
+            WaterTransparency = source.WaterTransparency;
             SuimonoSurfacePrefab = source.SuimonoSurfacePrefab;
             SuimonoModulePrefab = source.SuimonoModulePrefab;
             WaterfallEffectPrefab = source.WaterfallEffectPrefab;
@@ -326,7 +381,23 @@ namespace WaterSlides
         {
             AutoAssignPrefabs();
 
-            if (!EnableWater || SuimonoSurfacePrefab == null)
+            if (!EnableWater)
+            {
+                SetActive(false);
+                SetCustomActive(false);
+                return;
+            }
+
+            if (UseCustomShader)
+            {
+                SetActive(false);
+                BuildCustomWater(meshSettings, worldPoints, slide);
+                ConfigureWaterfall(meshSettings, worldPoints);
+                return;
+            }
+            SetCustomActive(false);
+
+            if (SuimonoSurfacePrefab == null)
             {
                 SetActive(false);
                 return;
@@ -341,9 +412,90 @@ namespace WaterSlides
                 RegisterWithModule();
         }
 
+        // ---- Свой шейдер: обычный MeshRenderer с лентой воды ----
+        GameObject _customRoot;
+        MeshFilter _customFilter;
+        MeshRenderer _customRenderer;
+
+        void BuildCustomWater(WaterSlideMeshBuilder.Settings meshSettings, List<Vector3> worldPoints, WaterSlideGenerator slide)
+        {
+            if (_customRoot == null)
+            {
+                var existing = transform.Find("SlideWaterMesh");
+                _customRoot = existing != null ? existing.gameObject : new GameObject("SlideWaterMesh");
+                _customRoot.transform.SetParent(transform, false);
+                _customRoot.transform.localPosition = Vector3.zero;
+                _customRoot.transform.localRotation = Quaternion.identity;
+                _customRoot.transform.localScale = Vector3.one;
+                if (!_customRoot.TryGetComponent(out _customFilter))
+                    _customFilter = _customRoot.AddComponent<MeshFilter>();
+                if (!_customRoot.TryGetComponent(out _customRenderer))
+                    _customRenderer = _customRoot.AddComponent<MeshRenderer>();
+                _customRenderer.shadowCastingMode = UnityEngine.Rendering.ShadowCastingMode.Off;
+                _customRenderer.receiveShadows = false;
+            }
+
+            if (_waterMesh != null)
+            {
+                if (Application.isPlaying) Destroy(_waterMesh); else DestroyImmediate(_waterMesh);
+                _waterMesh = null;
+            }
+
+            _waterMesh = WaterSlideMeshBuilder.BuildWaterSurface(worldPoints, meshSettings, WaterFill, MinWaterWidth);
+            if (_waterMesh == null)
+            {
+                SetCustomActive(false);
+                return;
+            }
+            _waterMesh.name = $"{slide.name}_SlideWater";
+            slide.KeepDerivedMeshTransient(_waterMesh);
+            _waterMesh.RecalculateTangents();
+            // Границы расширяем напрямую: ExpandMeshBounds добавляет вершины, и Unity
+            // обнуляет UV/тангенты — лента в метрах становилась невидимой (край = 0).
+            var b = _waterMesh.bounds;
+            b.Expand(4f);
+            _waterMesh.bounds = b;
+            _customFilter.sharedMesh = _waterMesh;
+
+            if (CustomWaterMaterial == null)
+            {
+                var shader = Shader.Find("WaterSlides/SlideWater");
+                if (shader != null)
+                    CustomWaterMaterial = new Material(shader) { name = "SlideWater (runtime)" };
+            }
+            _customRenderer.sharedMaterial = CustomWaterMaterial;
+
+            WaterSlideMeshBuilder.ComputeWaterChord(meshSettings, Mathf.Clamp01(WaterFill), out _, out float halfChord, MinWaterWidth);
+            var block = new MaterialPropertyBlock();
+            _customRenderer.GetPropertyBlock(block);
+            block.SetFloat("_RibbonWidth", halfChord * 2f);
+            WaterHalfWidth = halfChord;
+            // На стеклянном жёлобе прозрачная вода (альфа тона 0.2) над землёй в 260 м
+            // не читалась вовсе: пены и бликов больше (27.10.2026). Тон воды теперь общий для всех горок — градиент центр/край в шейдере (06.11.2026).
+            if (TryGetComponent<WaterSlideGenerator>(out var glassSlide) && glassSlide.GlassTube)
+            {
+                block.SetFloat("_FoamAmount", 1.3f);
+                block.SetFloat("_Glossiness", 1f);
+            }
+            _customRenderer.SetPropertyBlock(block);
+            SetCustomActive(true);
+        }
+
+        void SetCustomActive(bool active)
+        {
+            if (_customRoot == null)
+            {
+                var existing = transform.Find("SlideWaterMesh");
+                if (existing != null)
+                    _customRoot = existing.gameObject;
+            }
+            if (_customRoot != null && _customRoot.activeSelf != active)
+                _customRoot.SetActive(active);
+        }
+
         public void RegisterWithModule()
         {
-            if (!Application.isPlaying || !EnableWater)
+            if (!Application.isPlaying || !EnableWater || UseCustomShader)
                 return;
 
             EnsureSuimonoSurface();
@@ -366,6 +518,14 @@ namespace WaterSlides
 
         void EnsureSuimonoSurface()
         {
+            // Горки, достроенные на ходу: компонент включается раньше, чем курс скопирует
+            // в него префабы — берём их сами, а без префаба просто ждём Rebuild.
+            if (SuimonoSurfacePrefab == null)
+                AutoAssignPrefabs();
+            if (_surfaceRoot == null && SuimonoSurfacePrefab == null
+                && transform.Find("SuimonoWater") == null)
+                return;
+
             // The cached references are not serialized: after a domain reload they are null
             // while the child surface still exists. Adopt it instead of spawning a duplicate.
             if (_surfaceRoot == null)
@@ -409,7 +569,9 @@ namespace WaterSlides
                 _waterMesh = null;
             }
 
-            _waterMesh = WaterSlideMeshBuilder.BuildWaterSurface(worldPoints, meshSettings, WaterFill);
+            _waterMesh = WaterSlideMeshBuilder.BuildWaterSurface(worldPoints, meshSettings, WaterFill, MinWaterWidth);
+            WaterSlideMeshBuilder.ComputeWaterChord(meshSettings, Mathf.Clamp01(WaterFill), out _, out float suimonoHalfChord, MinWaterWidth);
+            WaterHalfWidth = suimonoHalfChord;
             if (_waterMesh == null)
             {
                 SetActive(false);
@@ -447,12 +609,29 @@ namespace WaterSlides
             _suimonoObject.enableTess = false;
             _suimonoObject.enableInteraction = false;
             _suimonoObject.underwaterDepth = 1f;
+            _suimonoObject.overallTransparency = Mathf.Clamp01(WaterTransparency);
 
             // Same preset → same wave density on every slide (meters in UV, not per-slide length/width).
             _suimonoObject.cmScaleX = Mathf.Max(1f / (WaveScale * 2f), 0.05f) * WaveStretchAcross;
             _suimonoObject.cmScaleY = Mathf.Max(1f / (WaveScale * 4f), 0.05f) * WaveStretchAlong;
 
             _suimonoObject.flowDirection = ComputeFlowDirection();
+
+            if (OverrideLook)
+            {
+                _suimonoObject.enableFoam = FoamAmount > 0.001f;
+                _suimonoObject.shallowFoamAmt = FoamAmount;
+                _suimonoObject.edgeFoamAmt = FoamAmount;
+                _suimonoObject.heightFoamAmt = FoamAmount;
+                // Высота пены по волнам > 0 обязательно: шейдер делит на неё (0 → NaN,
+                // и вся лента воды исчезала).
+                _suimonoObject.hFoamHeight = 0.5f;
+                _suimonoObject.hFoamSpread = 1f;
+                _suimonoObject.foamScale = FoamScale;
+                _suimonoObject.foamColor = Color.white;
+                _suimonoObject.shallowColor = ShallowColor;
+                _suimonoObject.depthColor = DepthColor;
+            }
         }
 
         float ComputeFlowDirection()
@@ -479,7 +658,9 @@ namespace WaterSlides
                 || !Mathf.Approximately(_suimonoObject.waveHeight, WaveHeight)
                 || !Mathf.Approximately(_suimonoObject.flowSpeed, FlowSpeed)
                 || !Mathf.Approximately(_suimonoObject.flowDirection, ComputeFlowDirection())
-                || !_suimonoObject.customWaves)
+                || !Mathf.Approximately(_suimonoObject.overallTransparency, Mathf.Clamp01(WaterTransparency))
+                || !_suimonoObject.customWaves
+                || (OverrideLook && (!Mathf.Approximately(_suimonoObject.shallowFoamAmt, FoamAmount) || _suimonoObject.shallowColor != ShallowColor)))
             {
                 ApplyDynamicSuimonoSettings();
             }
@@ -518,8 +699,12 @@ namespace WaterSlides
             if (material == null)
                 return;
 
-            material.SetFloat("suimono_trans_on", 0f);
-            material.DisableKeyword("SUIMONO_TRANS_ON");
+            // Без прозрачности шейдер не должен ждать trans-буфер (иначе вода пропадает).
+            if (!EnableTransparency)
+            {
+                material.SetFloat("suimono_trans_on", 0f);
+                material.DisableKeyword("SUIMONO_TRANS_ON");
+            }
         }
 
         void ApplyMeshToSuimonoRenderer()

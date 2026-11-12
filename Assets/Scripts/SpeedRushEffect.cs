@@ -2,23 +2,25 @@ using UnityEngine;
 
 // Nitro-style boost effect: while W is held the view "stretches" (FOV kick plus a
 // slight centre zoom) and the screen edges smear with a radial blur, scaled by the
-// current speed. Built-in RP image effect; added to the player camera automatically by
+// current speed (W/вверх — газ, полосы разгона). Built-in RP image effect; added to the player camera automatically by
 // PlayerCamera — disable the component to turn the effect off.
 [RequireComponent(typeof(Camera))]
 public class SpeedRushEffect : MonoBehaviour
 {
-    [Tooltip("Минимальная скорость, ниже которой эффект не включается даже с зажатым W, м/с.")]
-    [SerializeField] float _minSpeed = 4f;
-    [Tooltip("Скорость, на которой эффект при зажатом W выходит на полную силу, м/с.")]
-    [SerializeField] float _fullEffectSpeed = 12f;
+    [Tooltip("Скорость, с которой эффект начинает появляться (при газе или на полосе разгона), м/с. Ниже — эффекта нет. Сила растёт линейно от этой скорости до Full Effect Speed (просьба 28.10.2026: размытие только на высоких скоростях; раньше порог 4 и полная сила с 12 — эффект бил сразу).")]
+    [SerializeField] float _minSpeed = 14f;
+    [Tooltip("Скорость, на которой эффект выходит на полную силу, м/с.")]
+    [SerializeField] float _fullEffectSpeed = 24f;
     [Tooltip("Прибавка поля зрения на полной скорости, градусы — даёт ощущение растяжения.")]
     [SerializeField] float _fovKick = 9f;
     [Tooltip("Длина радиального размытия по краям экрана на полной скорости.")]
     [SerializeField, Range(0f, 0.3f)] float _blurLength = 0.12f;
     [Tooltip("Растяжение картинки от центра на полной скорости.")]
     [SerializeField, Range(0f, 0.15f)] float _stretch = 0.05f;
-    [Tooltip("Сглаживание нарастания/спада эффекта, сек.")]
-    [SerializeField] float _smoothTime = 0.18f;
+    [Tooltip("Сглаживание СПАДА эффекта, сек (отпустил газ / сошёл с полосы).")]
+    [SerializeField] float _smoothTime = 0.25f;
+    [Tooltip("Сглаживание НАРАСТАНИЯ эффекта, сек — размытие появляется плавно, а не ударом (просьба 28.10.2026: «чуть медленнее появляется»).")]
+    [SerializeField] float _riseTime = 0.6f;
 
     [Tooltip("Шейдер Hidden/WaterSlides/SpeedRush. Сериализованная ссылка гарантирует попадание шейдера в билд; в Editor подставляется автоматически.")]
     [SerializeField] Shader _shader;
@@ -74,11 +76,15 @@ public class SpeedRushEffect : MonoBehaviour
         // The boost look belongs to the BOOST: it turns on with W and fades out with it,
         // scaled by how fast the player actually goes.
         float speed = _targetBody != null ? _targetBody.linearVelocity.magnitude : 0f;
-        bool boosting = _view != null && _view.ThrottleInput > 0.01f;
+        // Разгон теперь с ускоряющих полос (W остался только для отладки в редакторе).
+        bool boosting = _view != null && (_view.BoostActive || _view.ThrottleInput > 0.01f);
+        // Сила — линейно от порога до полной скорости (не от нуля: иначе на пороге
+        // эффект уже стоял на половине силы и бил сразу).
         float target = boosting && speed > _minSpeed
-            ? Mathf.Clamp01(speed / Mathf.Max(_fullEffectSpeed, 0.1f))
+            ? Mathf.Clamp01((speed - _minSpeed) / Mathf.Max(_fullEffectSpeed - _minSpeed, 0.1f))
             : 0f;
-        _strength = Mathf.SmoothDamp(_strength, target, ref _strengthVelocity, _smoothTime);
+        float smooth = target > _strength ? _riseTime : _smoothTime;
+        _strength = Mathf.SmoothDamp(_strength, target, ref _strengthVelocity, smooth);
 
         if (_camera == null)
             return;

@@ -2,6 +2,22 @@ using System.Collections.Generic;
 using UnityEngine;
 using WaterSlides;
 
+// ДВИЖЕНИЕ ПО ГОРКЕ — ПУТЕВАЯ МОДЕЛЬ. Пока тело едет по горке, свободная физика
+// выключена: состояние езды — три числа в координатах жёлоба (дистанция s вдоль
+// пути, поперечное смещение l, скалярная скорость v вдоль пути), и каждый шаг
+// позиция/ориентация тела ставятся из кадра пути (через velocity, чтобы рендер
+// интерполировал). Правила игры выполняются ПО ПОСТРОЕНИЮ:
+//  * A/D двигают только l, и ввод не может затолкать тело выше стенки — вывалиться
+//    клавишами невозможно;
+//  * тело всегда ориентировано вдоль касательной пути — развернуть его поперёк нельзя;
+//  * W/S и проекция гравитации на касательную — одно скалярное уравнение на v:
+//    вниз разгоняет, вверх тормозит, но не ниже минимума (назад не поехать);
+//  * вылет за борт — честная инерция: центробежное ускорение v²·кривизна копит
+//    поперечную скорость, тело взбирается по виртуальному скату стенки и, если
+//    перевалило кромку, ОТСТЁГИВАЕТСЯ от пути в обычную баллистику — путь заворачивает,
+//    а свободное тело летит прямо и уходит за борт. Никаких скриптовых подбросов.
+// Воздух (прыжки, перелёты между горками, стрейф, рэгдол) остаётся на прежней
+// свободной физике; приземление на горку пристёгивает тело обратно к пути.
 [DefaultExecutionOrder(-100)]
 public class PlayerView : MonoBehaviour
 {
@@ -28,78 +44,104 @@ public class PlayerView : MonoBehaviour
     [SerializeField] float _capsuleFitSmoothing = 5f;
     [Tooltip("Масса тела, кг. Задаётся Rigidbody при старте; влияет на силу дополнительной гравитации.")]
     [SerializeField] float _mass = 10f;
-    [Tooltip("Множитель гравитации игрока — «вес». Больше — сильнее прижимает к жёлобу и стенкам (труднее вылететь за борт), короче дуги полёта. Требуемая скорость прыжков автоматически пересчитывается с учётом множителя (SetCourse).")]
+    [Tooltip("Множитель гравитации игрока — «вес». На горке задаёт разгон на спусках/торможение на подъёмах и прижим в поворотах; в полёте укорачивает дуги. Требуемая скорость прыжков автоматически пересчитывается с учётом множителя (SetCourse).")]
     [SerializeField] float _gravityMultiplier = 1.5f;
     [Tooltip("Скорость доворота тела к поверхности горки и к направлению полёта. Больше — быстрее и жёстче выравнивание ориентации.")]
     [SerializeField] float _slideAlignSpeed = 10f;
-    [Tooltip("Максимальный наклон тела носом вниз/вверх в свободном полёте, градусы.")]
+    [Tooltip("Максимальный наклон тела ногами ВВЕРХ в свободном полёте (пока скорость направлена вверх), градусы. Малый — на вылете с трамплина тело не задирает ноги в небо.")]
     [SerializeField, Range(0f, 90f)] float _maxAirPitch = 35f;
+    [Tooltip("Максимальный наклон тела ногами ВНИЗ при падении (скорость направлена вниз), градусы. Большой — в затяжном падении тело разворачивается ногами вперёд вдоль траектории, а не лежит плашмя.")]
+    [SerializeField, Range(0f, 90f)] float _maxAirDivePitch = 75f;
     [Tooltip("Локальное смещение визуальной модели относительно физического тела, метры. Применяется каждый кадр.")]
     [SerializeField] Vector3 _visualLocalOffset = Vector3.zero;
     [Tooltip("Локальный поворот визуальной модели относительно физического тела, градусы (углы Эйлера). Применяется каждый кадр.")]
     [SerializeField] Vector3 _visualLocalEuler = Vector3.zero;
+    [Tooltip("Поворот ПОЗЫ (кости таза и всего скелета) относительно физического тела, градусы. Модель — сам корень объекта (Animator на нём), отдельного дочернего объекта нет, поэтому поза разворачивается через таз после аниматора. Клип Flying лежит на животе головой по +Z; (180, 0, 0) кладёт на спину ногами вперёд. Пока работает рэгдол, не применяется (кости ведёт физика).")]
+    [SerializeField] Vector3 _hipsPoseEuler = new(180f, 0f, 0f);
+    [Tooltip("Прижать руки к туловищу: на сколько градусов плечевые кости доворачиваются к оси тела (от головы к тазу) ПОВЕРХ анимации, не дальше самой оси. 0 — как в клипе. Пока работает рэгдол, не применяется.")]
+    [SerializeField, Range(0f, 90f)] float _armsTuckDegrees = 30f;
+    [Tooltip("Свести ноги: на сколько градусов бедренные кости доворачиваются к средней линии между ногами ПОВЕРХ анимации, не дальше неё. 0 — как в клипе.")]
+    [SerializeField, Range(0f, 45f)] float _legsTuckDegrees = 15f;
 
     [Header("Slide Ride")]
-    [Tooltip("Дополнительный разгон вдоль уклона, м/с².")]
-    [SerializeField] float _slideAcceleration = 2.5f;
-    [Tooltip("Максимальная скорость на горке, м/с.")]
-    [SerializeField] float _maxSlideSpeed = 16f;
-    [Tooltip("Прижим к поверхности при контакте, м/с² — гасит подлёты на швах и гребнях. Действует ТОЛЬКО пока есть касание: настоящий вылет с гребня теряет контакт на первом же шаге, и прижим исчезает.")]
-    [SerializeField] float _stickAcceleration = 30f;
-    [Tooltip("Гашение боковых колебаний поперёк жёлоба.")]
-    [SerializeField] float _lateralDamping = 0.5f;
-    [Tooltip("Допустимая доля полуширины жёлоба до отключения притягивания к центру (от доступной полосы с учётом радиуса тела).")]
-    [SerializeField, Range(0.2f, 1f)] float _boundsLimit = 0.92f;
-    [Tooltip("Постоянное притягивание к центру жёлоба, м/с². Действует только при контакте.")]
-    [SerializeField] float _centeringAccel = 10f;
-    [Tooltip("Скорость сглаживания нормали поверхности (больше — быстрее реагирует).")]
-    [SerializeField] float _normalSmoothing = 14f;
-    [Tooltip("Дистанция от осевой линии, в пределах которой ищется ближайшая горка для ведения.")]
-    [SerializeField] float _guideCaptureDistance = 2.5f;
-    [Tooltip("Дистанция, на которой уже активное ведение отпускает тело (гистерезис: захват ближе, отпускание дальше).")]
-    [SerializeField] float _guideReleaseDistance = 7f;
-    [Tooltip("Потолок скорости доворота вектора скорости к направлению горки, рад/с. Действует только при контакте. На открытом жёлобе фактический доворот дополнительно ограничен сцеплением (поле ниже) — на скорости он слабее этого потолка.")]
-    [SerializeField] float _velocitySteer = 7f;
-    [Tooltip("«Сцепление» с открытым жёлобом в поворотах, м/с² — потолок центростремительного ускорения, с которым ведение заворачивает скорость вдоль пути. Задаёт предельную безопасную скорость поворота: √(сцепление × радиус). При 20: радиус 5 м — до ~10 м/с, радиус 14 м — до ~16.7 м/с. Быстрее — тело сползает на внешний борт и инерция выносит за борт; тормози S перед крутыми поворотами. В закрытой трубе не действует (там держит сама труба).")]
+    [Tooltip("Максимальная скорость на горке, м/с. Может быть автоматически поднята под требуемую скорость прыжков трассы (SetCourse). 0 — БЕЗ потолка (с 28.10.2026, просьба пользователя): скорость ограничивают только геометрия трассы, автотормоз перед поворотами и трамплином и тормоз игрока; потолок посадки тогда тоже не действует, а множитель разгона на спуске работает всегда.")]
+    [SerializeField] float _maxSlideSpeed = 0f;
+    [Tooltip("Минимальная скорость езды вдоль горки, м/с — ниже неё гравитация замедлить не может (подъёмы: тело никогда не скатывается назад; недостающую скорость докручивает «поток» с разгоном 25 м/с²). Зажатый тормоз S — осознанный выбор и может замедлять ниже минимума до полной остановки, но задний ход не начинается никогда. 0 — выключить.")]
+    [SerializeField] float _minRideSpeed = 14f;
+    [Tooltip("«Сцепление» с жёлобом, м/с² — используется автотормозом перед поворотами и генератором трассы для расчёта честности поворотов: безопасная скорость поворота ≈ √(доля × сцепление × радиус).")]
     [SerializeField] float _corneringGrip = 20f;
-    [Tooltip("Доля сцепления, остающаяся при зажатом A/D на открытом жёлобе (0–1). 0 — руль полностью отпускает доворот (вылет в повороте с рулём мгновенный и не зависит от скорости); 1 — руль не ослабляет сцепление. При 0.35 руление в повороте втрое режет предельную скорость — рискованно, но предсказуемо.")]
-    [SerializeField, Range(0f, 1f)] float _steerGripFraction = 0.35f;
-    [Tooltip("Доля сцепления, доступная автоведению БЕЗ нажатых A/D на открытом жёлобе (0–1). 1 — ведение держит любой честный поворот само (вылетов без руля не бывает); меньше — предельная скорость поворота без руля падает до √(доля × сцепление × радиус), выше неё инерция выносит за борт, и поворот нужно ДЕРЖАТЬ рулём в его сторону (сила руля прижимает к внутреннему борту) или сбрасывать скорость S. При 0.55 и сцеплении 20: поворот радиуса 15 м без руля держится до ~12.8 м/с, на потолке 16 м/с уже нужен руль.")]
-    [SerializeField, Range(0f, 1f)] float _autoGripFraction = 0.55f;
-    [Tooltip("Вынос за борт на пределе сцепления: сколько секунд ПОДРЯД требуемое поворотом центростремительное ускорение (скорость × кривизна пути) должно превышать доступное сцепление (доля сцепления с учётом руля; руль В сторону поворота добавляет свою силу, ОТ поворота — вычитает), чтобы жёлоб «отпустил» тело — его подбрасывает вдоль стенки и выносит за внешний борт. Нужно, потому что стенки узкого жёлоба геометрически держат тело как рельсы и честный занос перевалить через борт не может. 0 — механика выключена (вылетов в поворотах не будет).")]
-    [SerializeField] float _wallLaunchDelay = 0.2f;
-    [Tooltip("Пауза ведения после намеренного прыжка, сек.")]
-    [SerializeField] float _jumpGuideSuppression = 0.6f;
-    [Tooltip("Сглаживание направления ведения по пути (больше — быстрее следует за поворотами).")]
-    [SerializeField] float _guideTangentSmoothing = 18f;
-    [Tooltip("Время плавного включения ассиста после приземления, сек — чем больше, тем меньше «примагничивание» при попадании на следующую горку.")]
-    [SerializeField] float _captureEaseTime = 0.8f;
-    [Tooltip("Приземление на горку после полёта: в момент касания вектор скорости МГНОВЕННО задаётся вдоль горки (вниз по пути), величина скорости сохраняется полностью — весь запас хода переходит в езду. Выкл — скорость доворачивается постепенно (сцепление, рампа захвата и окно ловли поперечного приземления ниже).")]
-    [SerializeField] bool _landingAlignVelocity = true;
-    [Tooltip("Потолок скорости езды, которую задаёт снап приземления, м/с. При падении с большой высоты величина скорости огромна; без потолка она целиком переходила в ход вдоль горки — на первом же изгибе тело отрывалось от поверхности и вылетало (читалось как отскок). Излишек сверх потолка гасится ударом о воду. Если максимальная скорость на горке выше потолка — действует она. 0 — без потолка (прежнее поведение).")]
-    [SerializeField] float _landingSnapSpeedCap = 18f;
-    [Tooltip("Ловля ПОПЕРЕЧНОГО приземления: если после настоящего полёта скорость пришла к горке под углом к направлению пути больше этого порога (градусы, угол меряется в плоскости жёлоба), открывается окно быстрого доворота — ТЕЛО разворачивается вдоль горки на полной скорости выравнивания (а при выключенном мгновенном снапе выше — и скорость, со скоростью ниже). 0 — отключить.")]
-    [SerializeField] float _crossLandingAngle = 40f;
-    [Tooltip("Скорость доворота СКОРОСТИ вдоль пути в окне ловли, рад/с — используется, когда мгновенный снап скорости при приземлении выключен. Работает МИМО потолка сцепления и рампы захвата. Скорость при развороте не режется — только поворачивается.")]
-    [SerializeField] float _crossLandingTurnRate = 5f;
-    [Tooltip("Максимальная длительность окна быстрого доворота, сек — страховка: если довернуться вдоль пути не успели, окно закрывается само.")]
-    [SerializeField] float _crossLandingMaxTime = 0.6f;
-    [Tooltip("Антиотскок после приземления, сек: пока идёт окно (или окно удержания ниже), скорость при контакте удерживается в плоскости поверхности — «отдача» от гашения падения (импульс контакта, выталкивание из перекрытия) переводится в ход вдоль горки, а не в подскок. Величина скорости сохраняется. Вне окон при обычной езде НЕ действует (глушил бы честный подъём по стенке). Намеренный прыжок (пробел) окно не глушит. 0 — выключить.")]
-    [SerializeField] float _landingNoBounceTime = 0.25f;
-    [Tooltip("Удержание после приземления, сек: столько времени после касания горки тело НЕ может вылететь за борт — у стенки открытого жёлоба оно возвращается внутрь и наружная боковая скорость срезается, вынос инерцией за борт и приземления на кромку тоже ловятся. Намеренный прыжок пробелом работает как обычно. 0 — выключить.")]
+    [Tooltip("Доля сцепления, доступная езде БЕЗ ввода (0–1): автотормоз перед поворотом сбрасывает скорость до √(доля × сцепление × радиус). Меньше — осторожнее автотормоз; вылеты в поворотах начинаются на меньшей скорости.")]
+    [SerializeField, Range(0f, 1f)] float _autoGripFraction = 0.8f;
+    [Tooltip("Сила автотормоза перед поворотами и трамплином без ввода игрока (0–1). 1 — тормозит сам до безопасной скорости; 0 — выключен: скорость держит только игрок (S), иначе инерция в крутом повороте выносит за борт.")]
+    [SerializeField, Range(0f, 1f)] float _autoCornerBrake = 1f;
+    [Tooltip("Крутизна виртуального ската наружной стенки (метров подъёма на метр поперечного хода). Определяет порог вылета в повороте: тело начинает взбираться по стенке, когда центробежное ускорение v²/R превышает примерно гравитацию × эту крутизну (при гравитации ×2 и 0.7 — около 14 м/с²: 16 м/с в повороте радиусом 18 м). Меньше — вылеты легче и чаще; больше — жёлоб держит сильнее. До 28.10.2026 было 1.2 — вместе с удержанием ползунка без руля вылететь было невозможно.")]
+    [SerializeField] float _wallSlope = 0.7f;
+    [Tooltip("Гашение поперечной скорости на полу жёлоба, 1/с — успокаивает болтание влево-вправо после руления и приземлений. 0 — не гасить.")]
+    [SerializeField] float _lateralDamping = 1.5f;
+    [Tooltip("Трение на скате стенки, 1/с — гасит поперечную скорость, пока тело выше полосы пола. Короткий всплеск инерции (пересёк жёлоб и ткнулся в стенку) глохнет и тело сползает назад; вылетает за борт только ПОСТОЯННЫЙ перегон скорости в повороте (центробежная сила кормит подъём быстрее, чем трение гасит). Меньше — вылеты легче и быстрее: скорость подъёма по стенке = (центробежное − порог стенки) / это число.")]
+    [SerializeField] float _wallClimbDamping = 3f;
+    [Tooltip("Центробежный снос цели руля-ползунка: метров поперёк на каждый м/с² центробежного ускорения v²/R (и боковой гравитации на кренах). В повороте цель уезжает НАРУЖУ, и чтобы остаться в жёлобе, игрок должен увести палец внутрь поворота; без руля тело прижимается к наружной стенке и на скорости вылетает. Палец у внутренней стенки компенсирует около (ширина пола ÷ это число) м/с² — выше спасает только тормоз. 0 — регулятор держит тело у пальца с полной силой, и вылететь без руля нельзя (так было до 28.10.2026).")]
+    [SerializeField] float _cornerDriftPerAccel = 0.055f;
+    [Tooltip("«Липкость» на перегибах профиля (открытый жёлоб). Тело отрывается от горки, когда на выпуклом изломе (резкий уход в спуск, гребень) центробежное v²·кривизна превышает прижим гравитации × это число. 1 — физически честно; больше — тело липнет к профилю сильнее (отрывы реже); меньше — отрывается охотнее.")]
+    [SerializeField] float _crestStickiness = 1f;
+    [Tooltip("Удержание после приземления, сек: столько времени после пристёгивания к горке тело не может вылететь за борт (взбирание по стенке отключено, поперечное смещение зажато в жёлобе). 0 — выключить.")]
     [SerializeField] float _landingContainTime = 1f;
+    [Tooltip("Потолок скорости езды, которую задаёт пристёгивание при приземлении, м/с. При падении с большой высоты величина скорости огромна; излишек сверх потолка гасится ударом о воду. Если максимальная скорость на горке выше потолка — действует она; при выключенном потолке скорости (Max Slide Speed 0) не действует и этот. 0 — без потолка.")]
+    [SerializeField] float _landingSnapSpeedCap = 18f;
+    [Tooltip("Пауза повторного пристёгивания к горке после намеренного прыжка или вылета за борт, сек — чтобы жёлоб не поймал тело обратно в первый же миг.")]
+    [SerializeField] float _jumpGuideSuppression = 0.6f;
+    [Tooltip("Вылет за борт: минимальная скорость НАРУЖУ в момент перевала через кромку, м/с. Физически у кромки боковая скорость мала (3 м/с), тело за 0.6 с уходило на 2 м и падало обратно на стенку того же жёлоба — читалось как «край отталкивает обратно». С запасом наружу вылет становится настоящим.")]
+    [SerializeField] float _flyoutMinOutwardSpeed = 4f;
+    [Tooltip("Множитель боковой скорости наружу при вылете за борт (1 — физическая).")]
+    [SerializeField] float _flyoutOutwardBoost = 1.5f;
+    [Tooltip("После вылета за борт столько секунд тело не пристёгивается ни к какой горке — чтобы не ловиться за кромку той же горки в первые метры.")]
+    [SerializeField] float _flyoutSuppression = 1.2f;
+    [Tooltip("Зазор между поверхностью жёлоба и капсулой при езде, метры — тело ведётся чуть над мешем, чтобы коллайдер горки не пинал капсулу на швах.")]
+    [SerializeField] float _surfaceClearance = 0.03f;
+    [Tooltip("Скорость сглаживания нормали поверхности для ориентации тела и камеры (больше — быстрее реагирует).")]
+    [SerializeField] float _normalSmoothing = 14f;
+    [Tooltip("Разгон на спуске: множитель к составляющей гравитации вдоль пути, пока она РАЗГОНЯЕТ тело (на подъёмах торможение гравитацией без множителя). 1 — физически честно; больше — на спусках скорость набирается быстрее (потолок — максимальная скорость на горке). 1.8 → 1.3 06.11.2026: просьба «разгон помедленнее».")]
+    [SerializeField] float _downhillAccelBoost = 1.3f;
+
+    [Header("Приземление и падение")]
+    [Tooltip("Ловля горки свёрткой: каждый шаг физики в полёте отрезок пути центра капсулы (прошлое положение → текущее, плюс радиус вперёд) проверяется лучом на пересечение с внутренней поверхностью горки. Пересёк — тело ставится на поверхность и пристёгивается, даже если PhysX не выдал контакт (пролёт сквозь меш на скорости падения). Выкл — только контакты PhysX, как раньше.")]
+    [SerializeField] bool _sweepLanding = true;
+    [Tooltip("Проверка «есть ли горка, на которую ещё можно упасть» (CanStillReachSlide): горизонт баллистического прогноза, сек.")]
+    [SerializeField] float _reachHorizon = 8f;
+    [Tooltip("Запас на воздушное управление в прогнозе: радиус сферы вокруг точки траектории растёт с этой скоростью, м/с (A/D в полёте уводят тело вбок до 14 м/с), плюс 3·t² м на газ/тормоз W/S вдоль полёта. Щедро: игра начинается заново только когда горки точно не достать.")]
+    [SerializeField] float _reachSteerRadiusRate = 7f;
+    [Tooltip("Потолок радиуса сферы прогноза, м.")]
+    [SerializeField] float _reachMaxRadius = 25f;
 
     [Header("Movement")]
-    [Tooltip("Ускорение по W вдоль движения, м/с². Работает и на горке, и в воздухе.")]
-    [SerializeField] float _throttleAcceleration = 8f;
+    [Tooltip("Ускорение по W / стрелке вверх вдоль движения, м/с². Работает и на горке, и в воздухе.")]
+    [SerializeField] float _throttleAcceleration = 12f;
+    [Tooltip("Газ W: на сколько м/с можно превысить потолок скорости горки, пока зажата кнопка (излишек потом стекает мягким потолком). На спуске тело и так на потолке, без надбавки газ ничего не давал (просьба 28.10.2026). Риск осознанный: выше ~21 м/с тело срывается с перегибов, под которые трасса не рассчитана.")]
+    [SerializeField] float _throttleSpeedBonus = 3f;
     [Tooltip("Замедление по S, м/с². Работает и на горке, и в воздухе.")]
     [SerializeField] float _brakeAcceleration = 12f;
-    [Tooltip("Историческое поле скорости поворота на горке; в текущей логике движения не читается (сохранено ради сериализации), изменение значения ни на что не влияет.")]
-    [SerializeField] float _slideTurnSpeed = 140f;
-    [Tooltip("Сила руления A/D на горке, м/с². В открытом жёлобе прижимает к борту, в закрытой трубе раскачивает вокруг оси. Больше — резче уходит к краю.")]
-    [SerializeField] float _slideSteerForce = 22f;
-    [Tooltip("Потолок боковой скорости от руля A/D на открытом жёлобе, м/с. Держи НИЖЕ скорости выпрыгивания через стенку (~3.4 м/с при борте 0.6 м): сам руль лишь прижимает к борту, а выносит за борт только накопленная на скорости инерция — порог не срезает скорость, он только не даёт силе руля разгонять дальше.")]
-    [SerializeField] float _maxSlideSteerSpeed = 2.5f;
+    [Tooltip("Боковое ускорение руля на горке (ползунок-палец и A/D зонда), м/с². Двигает тело поперёк жёлоба; выше стенки ввод затолкать не может. Это же — предел силы, с которой палец у внутренней стенки удерживает тело против центробежного сноса.")]
+    [SerializeField] float _slideSteerForce = 40f;
+    [Tooltip("Потолок поперечной скорости, которую может разогнать руль, м/с. Ограничивает только ввод: накопленную в повороте инерцию порог не срезает. 6 — пол жёлоба (±0.9 м) пересекается за ~0.3 с.")]
+    [SerializeField] float _maxSlideSteerSpeed = 6f;
+    [Tooltip("Руль-ползунок (палец): как быстро тело идёт к заданному поперечному положению, 1/с. Поперечная скорость к цели = расстояние × это число (с потолком Max Slide Steer Speed), ускорение ограничено Slide Steer Force. Демпфирование — см. Steer Damping Ratio. 10 — отклик ~0.1 с; 6 (до 28.10.2026) читалось как вялый руль.")]
+    [SerializeField] float _lateralTargetGain = 10f;
+    [Tooltip("Руль-ползунок: затухание регулятора. 1 — критическое: тело подходит к пальцу без перелёта и обратного качания; 0.7 (до 06.11.2026) давало небольшой перелёт, который читался как дёрганье.")]
+    [SerializeField, Range(0.5f, 1.5f)] float _steerDampingRatio = 1f;
+    [Tooltip("Ускоряющая полоса на горке: добавка к разгону, м/с², пока тело едет по ней.")]
+    [SerializeField] float _boostAcceleration = 10f;
+    [Tooltip("Ускоряющая полоса: на сколько м/с можно превысить потолок скорости горки, пока тело на полосе (и ещё секунду после — излишек потом стекает). 0 — полоса лишь быстрее добирает до потолка. ВАЖНО: с +4 тело на 21 м/с срывалось с перегибов, под которые трасса не рассчитана (проверено автозаездом 27.10.2026: респавн каждый круг).")]
+    [SerializeField] float _boostSpeedBonus = 0f;
+    [Tooltip("Трамплинный разгон: за сколько метров до конца горки тело незаметно подтягивается до расчётной скорости прыжка (WaterSlideCourse.RequiredJumpSpeed), если иначе вылетело бы медленнее. Вход следующей горки стоит на дуге полёта под эту скорость; горки, кончающиеся носом вниз, при медленном вылете (тормоз, автотормоз, медленный разгон) давали недолёт, который не спасал даже прыжок (06.11.2026). 0 — выключить.")]
+    [SerializeField] float _exitBoostDistance = 15f;
+    [Tooltip("Трамплинный разгон: предел добавочного ускорения, м/с².")]
+    [SerializeField] float _exitBoostMaxAccel = 30f;
+    [Tooltip("Помощь приземлению: после вылета с КОНЦА горки (или прыжка в последних Exit Boost Distance метрах) скорость вдоль направления на начало следующей горки плавно подгоняется так, чтобы дуга пришла на её вход — и при перелёте, и при недолёте, и после прыжка. Боковой промах (смещение входа) не исправляется — это задача игрока (стрейф). Предел ускорения, м/с²; 0 — выключить. Анализ 06.11.2026 (меню Water Slides/Analyze Jumps): горка с концом −25° ловила следующую только при вылете 12–20 м/с, с прыжком — 8–12.")]
+    [SerializeField] float _landingAssistAccel = 25f;
+    [Tooltip("Помощь приземлению: куда целиться — на столько метров от начала следующей горки (внутрь ловчей рампы).")]
+    [SerializeField] float _landingAssistTargetS = 4f;
+    [Tooltip("Без прыжка не долететь (просьба 10.11.2026): если на перелёте с конца горки не было прыжка (прыжок у конца горки или прыжок в воздухе), полёт вдоль направления на вход гасится так, чтобы дуга опустилась до уровня НАЧАЛА следующей горки (её ловчей рампы) на столько метров раньше него — и прошла под ней. Целиться в долю скорости нельзя: ловчая рампа тянется навстречу вдоль линии прыжка и ловила даже сильно замедленные дуги (замер 10.11.2026). После прыжка в воздухе в том же полёте включается обычная помощь. 0 — правило выключено.")]
+    [SerializeField, Min(0f)] float _noJumpShortfall = 3f;
     [Tooltip("Скорость выпрыгивания с горки по нажатию прыжка, м/с (вдоль нормали поверхности с добавкой вверх). Больше — выше и дальше прыжок.")]
     [SerializeField] float _slideJumpForce = 9f;
     [Tooltip("Боковое ускорение A/D в воздухе, м/с² — в полёте манёвр должен быть заметно резче, чем на горке.")]
@@ -116,118 +158,190 @@ public class PlayerView : MonoBehaviour
     bool _spawnPrepared;
     bool _hasSlideContactSinceSpawn;
 
-    // Keyed by collider so an ignored (exterior) touch can never unbalance the count
-    // the way a plain enter/exit counter could.
-    readonly HashSet<Collider> _slideContacts = new();
-    Vector3 _slideNormal = Vector3.up;
-    Vector3 _slideNormalTarget = Vector3.up;
-
+    // ---- Состояние путевой модели езды ----
+    bool _riding;
     WaterSlideGenerator _currentSlide;
     WaterSlideCourse _course;
-    int _lastGuideIndex = -1;
-    Vector3 _guideTangent;
-    Vector3 _guideRight;
-    bool _guideIsOpenFlume;
-    Vector3 _smoothedGuideTangent;
-    bool _hasSmoothedGuideTangent;
-    bool _hasGuide;
-    bool _guideWasActive;
+    float _ridePathS;        // дистанция вдоль пути, м
+    // На сколько метров за край пола центробежный снос может увести цель ползунка:
+    // ограничивает скорость, с которой регулятор подводит тело к стенке
+    // (≤ DriftOverhang × гейн), дальше тело поднимает только физика ската.
+    const float DriftOverhang = 0.35f;
+    float _rideLateral;      // поперечное смещение от осевой, м (открытый жёлоб)
+    float _rideLateralVel;   // поперечная скорость, м/с
+    WaterSlideGenerator _landingAssistSlide; // следующая горка, на которую ведёт помощь приземлению
+    bool _landingAssistJumped;               // был ли прыжок на этом перелёте (без него — недолёт)
+    float _rideSpeed;        // скалярная скорость вдоль пути, м/с
+    float _tubeAngle;        // закрытая труба: угол на сечении от нижней точки, рад
+    float _tubeAngularVel;   // закрытая труба: угловая скорость, рад/с
+    float _smoothedCurvature;
+    float _cornerDanger;
+    float _landingContainTimer;
+    int _rideFrameIndex;
+    // Подскок с перегиба (не прыжок и не вылет): пока таймер жив, воздушное
+    // управление молчит — короткая баллистическая дуга над своей же горкой.
+    float _crestHopTimer;
+    // Сколько секунд тело пристёгнуто к текущей горке (0 в полёте).
+    float _rideTime;
+
+    // Кэш длин дуги кадров пути текущей горки (индекс i → дистанция от начала).
+    WaterSlideGenerator _lengthCacheSlide;
+    float[] _cumLengths;
+
+    // ---- Общее состояние (езда + полёт) ----
+    Vector3 _slideNormal = Vector3.up;
+    Vector3 _slideNormalTarget = Vector3.up;
+    Vector3 _guideTangent = Vector3.forward;
     float _guideSuppressTimer;
     float _timeSinceSlideContact = 999f;
-    float _assistRamp;
+    int _lastGuideIndex = -1;
+    // Центр капсулы на прошлом шаге физики — начало отрезка свёртки (ловля горки).
+    Vector3 _lastSweepCenter;
+    bool _hasLastSweepCenter;
+    readonly RaycastHit[] _sweepHits = new RaycastHit[16];
+    readonly Collider[] _overlapBuffer = new Collider[16];
 
-    // Cross-landing catch (see GuideAlongSlide): the pending flag is armed on a fresh
-    // landing after a real flight; the first guided step then measures the arrival angle
-    // and, if it is crosswise, opens the fast auto-turn window (the timer).
-    bool _crossLandingCheckPending;
-    float _crossLandingTimer;
-    float _landingNoBounceTimer;
-    // Post-landing containment window (see _landingContainTime): while open, the body
-    // may not leave the channel over a wall — rescues run and the flyout is gated.
-    float _landingContainTimer;
+    // Плоскость кромки/осевая линия ведущего открытого жёлоба — для камеры.
+    Vector3 _rimPlanePoint;
+    Vector3 _rimPlaneUp;
+    bool _hasRimPlane;
+    Vector3 _flumeCenterPoint;
 
     Vector3 _fitCenter;
     float _fitHeight;
     bool _fitInitialized;
     float _slideSteerInput;
-    // Over-grip launch state: the previous smoothed guide tangent (turn-rate probe),
-    // when it was sampled, and how long the corner demand has exceeded the grip.
-    Vector3 _prevGuideTangent;
-    float _prevGuideTangentTime = float.NegativeInfinity;
-    float _overGripTimer;
-    // A failed launch (clipped the lip, fell back in) must not retry instantly —
-    // the retry loop read as the body jerking up the wall and back every ~0.2 s.
-    float _lastWallLaunchTime = float.NegativeInfinity;
-    // Rim plane of the open flume currently guiding the body — published for the
-    // camera so it can proactively stay above the channel rim on banked corners.
-    Vector3 _rimPlanePoint;
-    Vector3 _rimPlaneUp;
-    bool _hasRimPlane;
+    float _slideLateralTarget;   // −1..1 (доля ширины пола), руль-ползунок
+    bool _hasLateralTarget;
+    float _boostTimer;           // >0 — тело на ускоряющей полосе или только что с неё
 
-    // Horizontal flight direction, frozen at the moment contact is lost: the whole
-    // flight (strafe axis, body yaw, camera) is anchored to it so A/D reads as a
-    // sideways SHIFT of the arc, never as a turn.
+    // Горизонтальное направление полёта, замороженное в момент отрыва: весь полёт
+    // (ось стрейфа, yaw тела, камера) привязан к нему, чтобы A/D читался как сдвиг
+    // дуги вбок, а не как поворот.
     Vector3 _flightHeading = Vector3.forward;
 
     public Rigidbody Rigidbody => _rigidbody;
     public Transform MovementTransform => transform;
-    // The course generator reads this to place jump landings on the REAL flight arc.
+    // Генератор трассы читает это, чтобы ставить приземления прыжков на настоящую дугу.
     public float GravityMultiplier => Mathf.Max(_gravityMultiplier, 1f);
-    // Read by WaterSlideCourse: the path generator keeps corners fair for THESE physics
-    // values — corner-holding limit √(grip·R) and the braking distance before sharp turns.
+    // Читаются WaterSlideCourse: честность поворотов и тормозные прямые считаются
+    // под эти значения игрока.
     public float CorneringGrip => _corneringGrip;
+    public float BrakeDeceleration => _brakeAcceleration;
+    // 0 в поле — потолка нет: наружу отдаём бесконечность, чтобы сравнения
+    // «скорость < потолка» (разгон, газ W) и Mathf.Min в генераторе трассы
+    // работали без особых случаев.
+    public bool HasSpeedCap => _maxSlideSpeed > 0f;
+    public float MaxRideSpeed => HasSpeedCap ? _maxSlideSpeed : float.PositiveInfinity;
 
-    // Rim plane of the open flume currently guiding the body: a point at lip-top
-    // level on the channel spine, plane normal = channel up. Kept briefly after
-    // contact loss so camera logic survives the micro-hops of a rough corner; false
-    // in closed tubes and in real flight.
+    public bool IsOnSlide => _riding;
+    // Горка, по которой тело едет (или ехало до отрыва); null до первого касания.
+    public WaterSlideGenerator CurrentSlide => _currentSlide;
+    public bool IsGuided => _riding;
+    // Подскок с перегиба профиля: тело в воздухе, но это короткая дуга над своей же
+    // горкой — воздушный стрейф там молчит (иначе зажатый A/D бил бы вбок с полной
+    // силой на каждом отрыве). Настоящие полёты (прыжок, вылет, сход с конца)
+    // таймер не взводят — там управление включается сразу.
+    public bool IsAirborneHopNearSlide => !_riding && _crestHopTimer > 0f;
+    public bool HasSlideContactSinceSpawn => _hasSlideContactSinceSpawn;
+    // Сколько секунд тело в полёте (0 на горке; 999 после спавна до первого касания).
+    public float TimeSinceSlideContact => _timeSinceSlideContact;
+    // Ставится PlayerFlightRagdoll: подгонка капсулы под машущие кости куклы раздула бы её в полёте.
+    public bool CapsuleFitSuspended { get; set; }
+    public Vector3 SlideNormal => _slideNormal;
+    // Центр капсулы в мире по ИНТЕРПОЛИРОВАННОМУ трансформу — точка слежения
+    // камеры. Пивот объекта стоит у ног (~1 м от центра): при развороте тела на
+    // перегибе пивот описывает дугу в полметра, и камера, идущая за пивотом,
+    // дёргалась вместе с ним; центр при развороте почти неподвижен.
+    public Vector3 BodyCenter => _capsule != null ? transform.TransformPoint(_capsule.center) : transform.position;
+    // Мировая точка касания горки: низ капсулы по текущей нормали. Пивот Player
+    // стоит у ног рига, поэтому эффекты «из-под тела» должны брать эту точку, а не
+    // transform.position и не фиксированный локальный сдвиг.
+    public Vector3 SlideContactPoint
+    {
+        get
+        {
+            Vector3 up = _slideNormal.sqrMagnitude > 1e-6f ? _slideNormal.normalized : Vector3.up;
+            return GetBodyCenterWorld() - up * (_capsule != null ? _capsule.radius : 0.35f);
+        }
+    }
+    // Ось стрейфа для PlayerController.ApplyAirMovement (см. _flightHeading).
+    public Vector3 FlightHeading => _flightHeading;
+    public float SpawnBodyClearance => _capsule != null ? _capsule.radius : 0.35f;
+
+    // Телеметрия/отладка: текущее состояние путевой модели.
+    public float RideSpeed => _rideSpeed;
+    public float RideLateral => _rideLateral;
+    public float RideLateralVelocity => _rideLateralVel;
+    public float RidePathDistance => _ridePathS;
+    // Тело на ускоряющей полосе (или сошло с неё меньше секунды назад) — для эффектов.
+    public bool BoostActive => _boostTimer > 0f;
+    public float AutoCornerBrake => _autoCornerBrake;
+    // Опасность ближайшего поворота для HUD: отношение центробежного ускорения
+    // v²·κ на самом крутом повороте в тормозном горизонте (включая текущий) к тому,
+    // что удерживает палец, уведённый в поворот до упора. ≥ 1 — на этой скорости
+    // поворот не удержать, спасает только тормоз; 0 — в воздухе, в трубе и на
+    // скорости «рельсовой» стенки (не выше минимума езды + 1).
+    public float CornerDanger => _riding ? _cornerDanger : 0f;
+    // Следующая горка курса после текущей (по порядку в Slides); null, если нет.
+    public WaterSlideGenerator NextSlide
+    {
+        get
+        {
+            if (_course == null || _currentSlide == null)
+                return null;
+            var slides = _course.Slides;
+            for (int i = 0; i < slides.Count - 1; i++)
+                if (slides[i] == _currentSlide)
+                    return slides[i + 1];
+            return null;
+        }
+    }
+    // Вызывается при каждом (ре)старте игры — HUD сбрасывает счёт.
+    public event System.Action PlayReset;
+
+    // Плоскость кромки ведущего открытого жёлоба: точка на уровне верха борта на
+    // осевой линии, нормаль = up жёлоба. Живёт только пока тело пристёгнуто к
+    // открытому жёлобу — в полёте и трубах выключена.
     public bool TryGetFlumeRimPlane(out Vector3 point, out Vector3 up)
     {
         point = _rimPlanePoint;
         up = _rimPlaneUp;
-        return _hasRimPlane && (IsOnSlide || _timeSinceSlideContact < 0.6f);
+        return _hasRimPlane && _riding;
     }
-    public float BrakeDeceleration => _brakeAcceleration;
-    public float MaxRideSpeed => _maxSlideSpeed;
-    public bool IsOnSlide => _slideContacts.Count > 0;
-    public bool IsGuided => _hasGuide;
 
-    // An airborne body still inside the current slide's capture volume (a seam hop, a
-    // scramble onto the wall lip that is about to come back down) — the FLIGHT controls
-    // must not engage there: the air strafe fired at full acceleration the instant the
-    // contact flickered and shoved the body sideways off the lip, which read as the
-    // slide itself kicking the player out. False once the body genuinely departs the
-    // channel (past the end, beyond the walls, below the floor) — that is the real
-    // flight to the next slide, where the controls belong. A deliberate jump and the
-    // over-grip launch suppress guidance and get the flight controls immediately.
-    public bool IsAirborneHopNearSlide =>
-        _hasSlideContactSinceSpawn
-        && _guideSuppressTimer <= 0f
-        && _currentSlide != null
-        && TryGetGuideFrameOnSlide(_currentSlide, out _, out _, out _, out _);
-    // The initial drop after a spawn/teleport is not a flight between slides.
-    public bool HasSlideContactSinceSpawn => _hasSlideContactSinceSpawn;
-    // Set by PlayerFlightRagdoll: fitting the capsule to flailing ragdoll bones would
-    // inflate it mid-flight, so the fit is frozen while the doll is live.
-    public bool CapsuleFitSuspended { get; set; }
-    public Vector3 SlideNormal => _slideNormal;
-
-    // Strafe axis anchor for PlayerController.ApplyAirMovement (see _flightHeading).
-    public Vector3 FlightHeading => _flightHeading;
-
-    // Lateral steer axis for A/D in an OPEN flume: the guide frame right (oriented to the
-    // right of the current motion). Unlike the surface-tangent right it never points up a
-    // wall, so a force along it presses the body INTO the wall instead of over the lip.
-    public bool TryGetOpenFlumeSteerAxis(out Vector3 right)
+    // Осевая линия ведущего открытого жёлоба: точка на оси, касательная пути, up жёлоба.
+    // Камера смещает точку подвеса к оси, когда тело прижато к стенке.
+    public bool TryGetFlumeCenterline(out Vector3 point, out Vector3 tangent, out Vector3 up)
     {
-        right = _guideRight;
-        return _hasGuide && _guideIsOpenFlume && right.sqrMagnitude > 1e-6f;
+        point = _flumeCenterPoint;
+        tangent = _guideTangent;
+        up = _rimPlaneUp;
+        return _hasRimPlane && _riding;
     }
-    public float SpawnBodyClearance => _capsule != null ? _capsule.radius : 0.35f;
+
+    // Касательная пути горки на `distanceAhead` метров ВПЕРЕДИ тела (для камеры:
+    // смотреть вдоль жёлоба и заранее поворачивать в виражи). Только на езде.
+    public bool TryGetRideAheadTangent(float distanceAhead, out Vector3 tangent)
+    {
+        tangent = Vector3.zero;
+        // На подскоке с перегиба путь ещё «свой»: камера продолжает смотреть вдоль
+        // жёлоба, а не дёргается на курс тела и обратно (s оценивается по скорости).
+        bool hop = !_riding && _crestHopTimer > 0f;
+        if ((!_riding && !hop) || _currentSlide == null || _cumLengths == null)
+            return false;
+
+        var frames = _currentSlide.RideFrames;
+        if (frames == null || frames.Count < 2 || _cumLengths.Length != frames.Count)
+            return false;
+
+        float s = _ridePathS + (hop ? _rideSpeed * _timeSinceSlideContact : 0f);
+        SampleFrame(frames, s + Mathf.Max(distanceAhead, 0f), out _, out tangent, out _, out _);
+        return tangent.sqrMagnitude > 1e-6f;
+    }
 
     public PlayerMovementSettings MovementSettings => new()
     {
-        SlideTurnSpeed = _slideTurnSpeed,
         SlideSteerForce = _slideSteerForce,
         MaxSlideSteerSpeed = _maxSlideSteerSpeed,
         SlideJumpForce = _slideJumpForce,
@@ -237,7 +351,7 @@ public class PlayerView : MonoBehaviour
         MaxAirStrafeSpeed = _maxAirStrafeSpeed,
         ThrottleAcceleration = _throttleAcceleration,
         BrakeAcceleration = _brakeAcceleration,
-        MaxForwardSpeed = _maxSlideSpeed
+        MaxForwardSpeed = MaxRideSpeed
     };
 
     public void Bind(PlayerController controller)
@@ -253,8 +367,8 @@ public class PlayerView : MonoBehaviour
         if (_rigidbody == null)
             return;
 
-        // Zero the velocities BEFORE switching to kinematic: a kinematic body rejects
-        // velocity writes with a console warning, and it has no velocity to clear anyway.
+        // Обнулить скорости ДО перевода в кинематику: кинематическое тело отклоняет
+        // запись скорости с предупреждением в консоли.
         if (!_rigidbody.isKinematic)
         {
             _rigidbody.linearVelocity = Vector3.zero;
@@ -262,7 +376,6 @@ public class PlayerView : MonoBehaviour
         }
 
         _rigidbody.isKinematic = true;
-        _slideContacts.Clear();
     }
 
     public void BeginPlay()
@@ -273,6 +386,8 @@ public class PlayerView : MonoBehaviour
         _rigidbody.isKinematic = false;
         _rigidbody.WakeUp();
         _spawnPrepared = false;
+        _boostTimer = 0f;
+        PlayReset?.Invoke();
     }
 
     void Awake()
@@ -294,15 +409,231 @@ public class PlayerView : MonoBehaviour
             return;
 
         UpdateColliderPose();
-        ApplyExtraGravity();
-        ApplySlidePhysics();
-        AlignBodyToContacts();
+
+        if (_guideSuppressTimer > 0f)
+            _guideSuppressTimer -= Time.fixedDeltaTime;
+        TickIgnoredSlideCollision();
+
+        if (_riding)
+        {
+            _timeSinceSlideContact = 0f;
+            UpdateRide();
+        }
+        else
+        {
+            _timeSinceSlideContact += Time.fixedDeltaTime;
+            if (_crestHopTimer > 0f)
+                _crestHopTimer -= Time.fixedDeltaTime;
+            if (!TrySweepLanding())
+            {
+                ApplyExtraGravity();
+                ApplyLandingAssist();
+            }
+        }
+
+        _lastSweepCenter = GetBodyCenterWorld();
+        _hasLastSweepCenter = true;
+        AlignBody();
         _controller?.FixedUpdate();
+    }
+
+    // Ловля горки свёрткой (жалоба 27.10.2026: «иногда пролетает сквозь горку при
+    // падении»). Контакты PhysX на скорости падения 25–35 м/с иногда не возникают:
+    // капсула за шаг проходит 0.5–0.7 м, а коллайдер горки — тонкая одиночная
+    // оболочка; CCD не всегда успевает. Отрезок центра капсулы за прошедший шаг
+    // (продлённый на радиус вперёд) проверяется лучом; пересечение внутренней
+    // поверхности горки = приземление: тело ставится на поверхность и пристёгивается.
+    // Возвращает true, если пристегнулось.
+    bool TrySweepLanding()
+    {
+        if (!_sweepLanding || !_hasLastSweepCenter || _rigidbody == null || _rigidbody.isKinematic)
+            return false;
+
+        Vector3 center = GetBodyCenterWorld();
+        Vector3 motion = center - _lastSweepCenter;
+        float travelled = motion.magnitude;
+        if (travelled < 1e-4f)
+            return false;
+
+        float radius = _capsule != null ? _capsule.radius : 0.35f;
+        Vector3 dir = motion / travelled;
+        float length = travelled + radius;
+        int count = Physics.RaycastNonAlloc(_lastSweepCenter, dir, _sweepHits, length, ~0, QueryTriggerInteraction.Ignore);
+        if (count == 0)
+            return false;
+
+        WaterSlideGenerator best = null;
+        RaycastHit bestHit = default;
+        for (int i = 0; i < count; i++)
+        {
+            var hit = _sweepHits[i];
+            if (best != null && hit.distance >= bestHit.distance)
+                continue;
+            if (hit.collider == null || hit.collider == _ignoredSlideCollider)
+                continue;
+            var slide = GetSlideFrom(hit.collider);
+            if (slide == null || !IsInnerSurfacePoint(slide, hit.point, hit.normal))
+                continue;
+            // Подавление после прыжка/вылета — только для СВОЕЙ горки: другая горка
+            // на пути — настоящее приземление.
+            if (_guideSuppressTimer > 0f && slide == _currentSlide)
+                continue;
+            best = slide;
+            bestHit = hit;
+        }
+
+        if (best == null)
+            return false;
+
+        // Тело — на поверхность в точке пересечения, затем обычное пристёгивание
+        // (оно само считает s, поперечное положение и скорость по положению тела).
+        Vector3 targetCenter = bestHit.point + bestHit.normal * (radius + _surfaceClearance);
+        _rigidbody.position += targetCenter - center;
+        AttachToSlide(best);
+        return _riding;
+    }
+
+    // Может ли тело из текущего положения и скорости ещё попасть на какую-нибудь
+    // горку: баллистический прогноз (гравитация игрока, без сопротивления) на
+    // _reachHorizon секунд шагами 0.1 с; каждый отрезок проверяется сферой, радиус
+    // которой растёт со временем — запас на воздушное управление A/D. Считается
+    // только ВНУТРЕННЯЯ поверхность горки (на дно снизу не приземлиться). Читает
+    // EntryPoint: игра начинается заново, только когда это false.
+    public bool CanStillReachSlide()
+    {
+        if (_rigidbody == null)
+            return true;
+
+        Vector3 pos = GetBodyCenterWorld();
+        Vector3 vel = _rigidbody.linearVelocity;
+        Vector3 g = Physics.gravity * GravityMultiplier;
+        const float step = 0.1f;
+        float t = 0f;
+        while (t < _reachHorizon)
+        {
+            Vector3 next = pos + vel * step + g * (0.5f * step * step);
+            Vector3 seg = next - pos;
+            float len = seg.magnitude;
+            if (len > 1e-4f)
+            {
+                // Боковой стрейф (линейно по t) + газ/тормоз вдоль полёта (±6 м/с² → 3·t²).
+                float radius = Mathf.Min(0.8f + _reachSteerRadiusRate * t + 3f * t * t, _reachMaxRadius);
+                int count = Physics.SphereCastNonAlloc(pos, radius, seg / len, _sweepHits, len, ~0, QueryTriggerInteraction.Ignore);
+                for (int i = 0; i < count; i++)
+                {
+                    var hit = _sweepHits[i];
+                    if (hit.collider == null)
+                        continue;
+                    var slide = GetSlideFrom(hit.collider);
+                    if (slide != null && IsInnerSurfacePoint(slide, hit.point, hit.normal))
+                        return true;
+                }
+
+                // SphereCast НЕ видит коллайдер, который сфера задевает уже в начале
+                // отрезка, — а с радиусом в метры это ровно горка рядом с телом.
+                // Перекрытие: горка, чей ближайший кадр пути не выше тела и в пределах
+                // радиуса (+ полуширина жёлоба), считается достижимой.
+                int overlaps = Physics.OverlapSphereNonAlloc(pos, radius, _overlapBuffer, ~0, QueryTriggerInteraction.Ignore);
+                for (int i = 0; i < overlaps; i++)
+                {
+                    var slide = _overlapBuffer[i] != null ? GetSlideFrom(_overlapBuffer[i]) : null;
+                    var frames = slide != null ? slide.RideFrames : null;
+                    if (frames == null || frames.Count == 0)
+                        continue;
+                    Vector3 fp = frames[FindNearestFrame(frames, pos, 0, frames.Count - 1)].Position;
+                    if (fp.y <= pos.y + 1f && (fp - pos).magnitude <= radius + slide.RideHalfWidth)
+                        return true;
+                }
+            }
+            pos = next;
+            vel += g * step;
+            t += step;
+        }
+        return false;
     }
 
     void LateUpdate()
     {
         ApplyVisualLocalPose();
+        ApplyHipsPose();
+        ApplyLimbTuck();
+    }
+
+    // Руки к туловищу, ноги вместе — поверх клипа, в МИРОВЫХ осях (локальные оси
+    // костей ригов разные, а поворот «направление кости → цель» от них не зависит).
+    // Поворачивается только плечевая/бедренная кость, предплечье и голень едут с ней.
+    void ApplyLimbTuck()
+    {
+        if (_animator == null || !_animator.isHuman)
+            return;
+        if (_flightRagdoll != null && _flightRagdoll.IsActive)
+            return;
+
+        var hips = _animator.GetBoneTransform(HumanBodyBones.Hips);
+        var head = _animator.GetBoneTransform(HumanBodyBones.Head);
+        if (hips == null || head == null)
+            return;
+
+        if (_armsTuckDegrees > 0f)
+        {
+            Vector3 torsoDown = (hips.position - head.position).normalized;
+            TuckLimb(HumanBodyBones.LeftUpperArm, HumanBodyBones.LeftLowerArm, torsoDown, _armsTuckDegrees);
+            TuckLimb(HumanBodyBones.RightUpperArm, HumanBodyBones.RightLowerArm, torsoDown, _armsTuckDegrees);
+        }
+
+        if (_legsTuckDegrees > 0f)
+        {
+            var lUp = _animator.GetBoneTransform(HumanBodyBones.LeftUpperLeg);
+            var lLow = _animator.GetBoneTransform(HumanBodyBones.LeftLowerLeg);
+            var rUp = _animator.GetBoneTransform(HumanBodyBones.RightUpperLeg);
+            var rLow = _animator.GetBoneTransform(HumanBodyBones.RightLowerLeg);
+            if (lUp != null && lLow != null && rUp != null && rLow != null)
+            {
+                Vector3 mid = ((lLow.position - lUp.position).normalized + (rLow.position - rUp.position).normalized).normalized;
+                if (mid.sqrMagnitude > 0.5f)
+                {
+                    TuckLimb(HumanBodyBones.LeftUpperLeg, HumanBodyBones.LeftLowerLeg, mid, _legsTuckDegrees);
+                    TuckLimb(HumanBodyBones.RightUpperLeg, HumanBodyBones.RightLowerLeg, mid, _legsTuckDegrees);
+                }
+            }
+        }
+    }
+
+    void TuckLimb(HumanBodyBones upperBone, HumanBodyBones lowerBone, Vector3 target, float degrees)
+    {
+        var upper = _animator.GetBoneTransform(upperBone);
+        var lower = _animator.GetBoneTransform(lowerBone);
+        if (upper == null || lower == null)
+            return;
+
+        Vector3 dir = lower.position - upper.position;
+        if (dir.sqrMagnitude < 1e-6f)
+            return;
+        dir.Normalize();
+        Vector3 turned = Vector3.RotateTowards(dir, target, degrees * Mathf.Deg2Rad, 0f);
+        upper.rotation = Quaternion.FromToRotation(dir, turned) * upper.rotation;
+    }
+
+    // Разворот позы после аниматора: таз — прямой ребёнок корня, его локальное
+    // пространство = пространство тела, поэтому поворот и позиция просто домножаются.
+    // Рэгдол (DefaultExecutionOrder 10) бежит ПОСЛЕ этого LateUpdate: строит куклу и
+    // смешивает снимок позы уже с развёрнутым скелетом; пока кукла жива — кости у физики.
+    void ApplyHipsPose()
+    {
+        if (_animator == null || !_animator.isHuman || _animator.transform != transform)
+            return;
+        if (_flightRagdoll != null && _flightRagdoll.IsActive)
+            return;
+        if (_hipsPoseEuler.sqrMagnitude < 1e-6f)
+            return;
+
+        var hips = _animator.GetBoneTransform(HumanBodyBones.Hips);
+        if (hips == null || hips.parent != transform)
+            return;
+
+        var flip = Quaternion.Euler(_hipsPoseEuler);
+        hips.localRotation = flip * hips.localRotation;
+        hips.localPosition = flip * hips.localPosition;
     }
 
     void ApplyVisualLocalPose()
@@ -331,10 +662,9 @@ public class PlayerView : MonoBehaviour
             _rigidbody.centerOfMass = _capsule.center;
     }
 
-    // The capsule ALWAYS lies along local Z (the body slides feet/head first along its
-    // forward). Only the extent and the centre are fitted to the animated pose: picking
-    // the axis from the head-to-feet line made the capsule flip sideways on arched poses,
-    // and every flip in contact is a depenetration kick (visible as violent jitter).
+    // Капсула ВСЕГДА лежит вдоль локального Z (тело скользит головой/ногами вперёд).
+    // Подгоняются только длина и центр: выбор оси по линии голова-ноги переворачивал
+    // капсулу вбок на выгнутых позах, а каждый переворот в контакте — пинок депенетрации.
     bool TryFitCapsuleToAnimatedBody()
     {
         if (_animator == null || !_animator.isHuman)
@@ -375,9 +705,9 @@ public class PlayerView : MonoBehaviour
             _fitHeight = Mathf.Lerp(_fitHeight, height, k);
         }
 
-        // Deadband: while sliding the capsule is effectively frozen (re-fitting it in
-        // contact kicks the body off the surface); in the air a small threshold is enough.
-        float deadband = IsOnSlide ? 0.06f : 0.02f;
+        // Мёртвая зона: при езде капсула фактически заморожена (переподгонка в контакте
+        // пинает тело от поверхности); в воздухе достаточно маленького порога.
+        float deadband = _riding ? 0.06f : 0.02f;
         bool changed = _capsule.direction != 2
             || (_capsule.center - _fitCenter).sqrMagnitude > deadband * deadband
             || Mathf.Abs(_capsule.height - _fitHeight) > deadband;
@@ -397,19 +727,14 @@ public class PlayerView : MonoBehaviour
 
         _rigidbody.AddForce(Physics.gravity * (_gravityMultiplier - 1f) * _rigidbody.mass, ForceMode.Force);
 
-        // The doll's bones fall under plain 1g; without the same extra pull the whole
-        // doll "floats up" against the capsule for the entire flight and the head weld
-        // keeps yanking it back down — visible as sluggish, rubbery flight response.
+        // Кости куклы падают под обычным 1g; без той же добавки кукла «всплывает»
+        // относительно капсулы весь полёт.
         if (_flightRagdoll != null)
             _flightRagdoll.AddAcceleration(Physics.gravity * (_gravityMultiplier - 1f));
     }
 
-    // Air-control forces (strafe and its damping) must accelerate the capsule AND the
-    // live flight doll identically: applied to the capsule alone they reach the visible
-    // body only through the head weld, so it swings behind like a pendulum and catches
-    // up late — steering read as delayed even though the capsule responds instantly.
-    // While the doll is inactive (riding, or the component is absent) this is exactly
-    // AddForce(Acceleration) on the capsule.
+    // Силы воздушного управления должны разгонять капсулу И живую куклу одинаково,
+    // иначе видимое тело маятником отстаёт от капсулы.
     public void AddAirControlAcceleration(Vector3 acceleration)
     {
         if (_rigidbody == null)
@@ -420,805 +745,1054 @@ public class PlayerView : MonoBehaviour
             _flightRagdoll.AddAcceleration(acceleration);
     }
 
-    void ApplySlidePhysics()
+    // ================= ЕЗДА ПО ПУТИ =================
+
+    void UpdateRide()
     {
-        _guideWasActive = _hasGuide;
-        _hasGuide = false;
-
-        if (_rigidbody == null)
-            return;
-
-        if (IsOnSlide)
+        var frames = _currentSlide != null ? _currentSlide.RideFrames : null;
+        if (frames == null || frames.Count < 2)
         {
-            // A landing after a real flight (not a seam hop) restarts the assist ramp:
-            // the next slide must not yank the body onto its path the moment it touches.
-            if (_timeSinceSlideContact > 0.3f)
-            {
-                _assistRamp = 0f;
-                // Arm the cross-landing check: the first guided step measures the angle.
-                _crossLandingCheckPending = true;
-                // And the no-bounce window: the touchdown must convert the fall into
-                // ride speed, never into a hop off the surface.
-                _landingNoBounceTimer = _landingNoBounceTime;
-                // And the containment window: right after a landing the body may not
-                // leave the channel over a wall (user rule — a fresh landing gets a
-                // beat of safety before flyouts become possible again).
-                _landingContainTimer = _landingContainTime;
-            }
-            _assistRamp += Time.fixedDeltaTime;
-            _timeSinceSlideContact = 0f;
-
-            // While riding, the launch heading tracks the horizontal motion; once
-            // contact is lost it simply stops updating — frozen for the whole flight.
-            Vector3 horizontalVel = Vector3.ProjectOnPlane(_rigidbody.linearVelocity, Vector3.up);
-            if (horizontalVel.sqrMagnitude > 0.25f)
-                _flightHeading = horizontalVel.normalized;
+            DetachFromSlide(_rigidbody.linearVelocity, 0.2f);
+            return;
         }
-        else
-            _timeSinceSlideContact += Time.fixedDeltaTime;
 
-        if (_landingNoBounceTimer > 0f)
-            _landingNoBounceTimer -= Time.fixedDeltaTime;
+        // Перегенерация горки в Play-режиме пересобирает кадры — кэш длин обязан
+        // совпадать с ними по числу элементов.
+        if (_cumLengths == null || _cumLengths.Length != frames.Count)
+            BuildLengthCache(_currentSlide);
+
+        float dt = Time.fixedDeltaTime;
+        _rideTime += dt;
         if (_landingContainTimer > 0f)
-            _landingContainTimer -= Time.fixedDeltaTime;
+            _landingContainTimer -= dt;
 
-        // The path assist runs ONLY while the body actually touches the slide. Airborne
-        // it is fully ballistic — nothing steers, contains or pulls it back — so enough
-        // speed genuinely throws the player over a wall or off a crest.
-        if (_guideSuppressTimer > 0f)
-            _guideSuppressTimer -= Time.fixedDeltaTime;
-        else if (IsOnSlide)
-        {
-            var guideSlide = ResolveGuideSlide();
-            if (guideSlide != null && guideSlide != _currentSlide)
-                TrackCurrentSlide(guideSlide);
-
-            if (guideSlide != null
-                && TryGetGuideFrameOnSlide(guideSlide, out Vector3 center, out Vector3 tangent, out Vector3 guideUp, out float halfWidth))
-                GuideAlongSlide(guideSlide, center, tangent, guideUp, halfWidth);
-        }
-
-        // Smooth the surface normal: raw per-triangle contact normals change every step and
-        // are the main source of jitter.
-        if (IsOnSlide || _hasGuide)
-        {
-            float normalLerp = 1f - Mathf.Exp(-_normalSmoothing * Time.fixedDeltaTime);
-            _slideNormal = Vector3.Slerp(_slideNormal, _slideNormalTarget, normalLerp).normalized;
-        }
-
-        if (!IsOnSlide)
-            return;
-
-        _rigidbody.WakeUp();
-
-        Vector3 normal = _slideNormal;
-        Vector3 vel = _rigidbody.linearVelocity;
-
-        // Remove the velocity component pushing into the surface (no micro-bounces on seams).
-        Vector3 intoSurface = Vector3.Project(vel, normal);
-        if (Vector3.Dot(intoSurface, normal) < 0f)
-        {
-            vel -= intoSurface;
-            _rigidbody.linearVelocity = vel;
-        }
-        // Anti-bounce inside the post-landing windows (the no-bounce beat AND the
-        // containment second — leaving the channel is forbidden there anyway): the
-        // contact impulse and the depenetration push both kick OUTWARD along the
-        // normal, and with the touchdown snap feeding the full fall speed into the
-        // ride the kick read as a visible hop off the next slide. The outward
-        // velocity is ROTATED back into the surface plane (magnitude kept — the kick
-        // becomes ride speed, not a hop). NOT active during plain riding: an honest
-        // climb up the wall (banked corner, drifting to the lip with no input) reads
-        // as "outward" against the lagging floor-and-wall smoothed normal, and a
-        // full-time flatten kept hurling the body back down into the channel. The
-        // ride-time wall-facet kicks are tamed at the source instead — see the
-        // maxDepenetrationVelocity cap in EnsurePhysicsSetup. A deliberate jump
-        // suppresses guidance and is never flattened.
-        else if ((_landingNoBounceTimer > 0f || _landingContainTimer > 0f) && _guideSuppressTimer <= 0f)
-        {
-            // Checked against BOTH normals: the raw contact normal (the honest local
-            // facet), and the smoothed one — a high-speed impact on a triangle edge
-            // reports a junk contact normal, the solver kick along it reads as flat to
-            // that junk plane and escaped the raw check, while the smoothed normal
-            // barely follows one-frame junk and still sees the velocity as outward.
-            bool changed = FlattenOutward(ref vel, _slideNormalTarget);
-            changed |= FlattenOutward(ref vel, _slideNormal);
-            if (changed)
-                _rigidbody.linearVelocity = vel;
-        }
-
-        float speed = vel.magnitude;
-
-        // Press the body onto the surface. Removed once as a "magnet" — and the ride
-        // immediately started hopping off at every facet seam (read as constant bouncing
-        // off the slide). Contact-only, so it does NOT prevent real launches: a crest
-        // exit loses contact on the first airborne step and the force is gone with it.
-        // Released while A/D is held: at the floor-wall junction the smoothed normal
-        // averages BOTH faces, so the stick gains a tangential component down the wall
-        // (up to ~sin(45°)·30 ≈ 21 м/с²) that overpowered the steer force — the edge
-        // felt like an invisible wall where the keys stopped working.
-        // Scaled by riding speed: the press exists to stop seam hops AT SPEED. For a
-        // nearly stopped body (a crash into a tube corner) the smoothed normal averages
-        // the floor and the facing wall, and the full press squeezed the body INTO the
-        // wedge for seconds — penetration grew until depenetration found the shortest
-        // exit on the OUTER side and popped the body through the shell.
-        // Muted while guidance is suppressed (deliberate jump, over-grip launch): near
-        // the floor-wall junction the smoothed normal averages both faces and the
-        // press gains a tangential component DOWN the wall (up to ~21 м/с²) — enough
-        // to stall a takeoff that climbs along the wall before it clears the lip.
-        float stickScale = _guideSuppressTimer > 0f
-            ? 0f
-            : (1f - Mathf.Clamp01(Mathf.Abs(_slideSteerInput))) * Mathf.Clamp01(speed / 3f);
-        if (stickScale > 0f)
-            _rigidbody.AddForce(-normal * (_stickAcceleration * stickScale), ForceMode.Acceleration);
-
-        // Downhill push with a hard speed cap — uncapped acceleration is what threw the
-        // body over the flume walls in corners.
-        if (speed < _maxSlideSpeed)
-        {
-            Vector3 downhill = Vector3.ProjectOnPlane(Physics.gravity, normal);
-            if (downhill.sqrMagnitude > 1e-4f)
-                _rigidbody.AddForce(downhill.normalized * _slideAcceleration, ForceMode.Acceleration);
-        }
-        else
-        {
-            // Over the cap right after landing: the excess bleeds off over the capture
-            // ease instead of being cut the moment the body touches the next slide.
-            _rigidbody.linearVelocity = vel * Mathf.Lerp(1f, _maxSlideSpeed / speed, AssistWeight);
-        }
-    }
-
-    // Rotates the velocity component pointing OUT along the normal back into the
-    // surface plane, keeping the magnitude — the kick becomes ride speed, not a hop.
-    static bool FlattenOutward(ref Vector3 vel, Vector3 normal)
-    {
-        float outward = Vector3.Dot(vel, normal);
-        if (outward <= 1e-3f)
-            return false;
-
-        Vector3 flat = vel - normal * outward;
-        if (flat.sqrMagnitude <= 1e-4f)
-            return false;
-
-        vel = flat.normalized * vel.magnitude;
-        return true;
-    }
-
-    // 0 → 1 over _captureEaseTime after a fresh landing: every path-assist force is
-    // scaled by this, so a new slide takes hold gradually instead of magnetizing.
-    float AssistWeight => _captureEaseTime > 1e-4f ? Mathf.Clamp01(_assistRamp / _captureEaseTime) : 1f;
-
-    // Contact-only ride assist: rotates the velocity along the course and damps the
-    // side-to-side wobble. It never PULLS the body onto the slide — containment is the
-    // collider's job, and once contact is lost the flight is fully ballistic, so speed
-    // can genuinely carry the player over a wall or off a crest.
-    void GuideAlongSlide(WaterSlideGenerator slide, Vector3 center, Vector3 tangent, Vector3 guideUp, float halfWidth)
-    {
-        Vector3 vel = _rigidbody.linearVelocity;
-
-        // Tangent oriented along the current motion. A cross-path landing (a hop that
-        // came back down mid-curve) makes the velocity nearly PERPENDICULAR to the
-        // path — the sign of its dot with the tangent is then pure noise, and a wrong
-        // flip steered the velocity BACKWARD along the slide and spun the body ~180°
-        // (read as "turned crosswise on landing"). When the along-path component is
-        // too small to trust, the body forward picks the direction instead.
-        Vector3 reference = vel.sqrMagnitude > 0.25f ? vel.normalized : transform.forward;
-        float along = Vector3.Dot(tangent, reference);
-        if (Mathf.Abs(along) < 0.35f)
-            along = Vector3.Dot(tangent, transform.forward);
-        // Fully crosswise landing: BOTH the velocity and the body forward (yaw is
-        // anchored to the flight heading, i.e. also crosswise) are useless for the sign —
-        // prefer the DOWNHILL end of the path, so the auto-turn never sends the body
-        // riding backward up the slide.
-        if (Mathf.Abs(along) < 0.35f)
-            along = -tangent.y;
-        if (along < 0f)
-            tangent = -tangent;
-
-        // Time-smooth the guide direction: per-segment tangents are piecewise, and every
-        // joint would otherwise kick the velocity steering (visible as twitchy turns).
-        if (!_hasSmoothedGuideTangent || Vector3.Dot(_smoothedGuideTangent, tangent) < 0f)
-        {
-            _smoothedGuideTangent = tangent;
-            _hasSmoothedGuideTangent = true;
-        }
-        else
-        {
-            float tk = 1f - Mathf.Exp(-_guideTangentSmoothing * Time.fixedDeltaTime);
-            _smoothedGuideTangent = Vector3.Slerp(_smoothedGuideTangent, tangent, tk).normalized;
-        }
-
-        tangent = _smoothedGuideTangent;
-        _guideTangent = tangent;
-        _hasGuide = true;
-
-        // Everything below fades in with the capture ramp: a freshly landed body keeps
-        // its arrival trajectory and the slide takes hold gradually.
-        float assist = AssistWeight;
-
-        // ...but the ramp must not zero the CATCH. A body coming back down onto the
-        // slide mid-curve arrives with real cross-path velocity, and with the ramp at
-        // zero nothing bent the motion along the channel — it crossed the flume,
-        // climbed the far wall and left. The steering that catches (velocity steer,
-        // cross-flow damping) keeps a floor; only the cosmetic pulls (centering, the
-        // speed cut) still ramp from zero, so landings stay free of the magnet feel.
-        float catchAssist = Mathf.Lerp(0.4f, 1f, assist);
-
-        // While the player steers with A/D the assist FULLY releases the lateral axis:
-        // the velocity steer and the cross-flow dampers otherwise eat the sideways speed
-        // faster than the steer force can build it, and the input feels dead. Full
-        // release also means corners stop auto-following at full steer — built-up
-        // inertia can genuinely carry the body up and over the flume wall.
-        float steerFree = 1f - Mathf.Clamp01(Mathf.Abs(_slideSteerInput));
-
-        // Rotate the velocity towards the path direction (keeps the speed): in corners the
-        // required centripetal acceleration exceeds what push forces can provide, so the
-        // direction itself must follow the slide.
-        //
-        // GRIP MODEL (open flume): the turn rate is capped by lateral acceleration, not
-        // by a fixed rad/s — a fixed rate held ANY corner at ANY speed (7 rad/s vs the
-        // 3.2 needed for R=5 m at 16 м/с), so speed never mattered and flyouts felt
-        // random (they came only from touching A/D or from the landing ramp). With the
-        // cap each corner has a real max safe speed √(grip·R): above it the assist can't
-        // bend the velocity fast enough, the body visibly drifts up the outer wall and
-        // inertia carries it over — the player can SEE that braking is needed.
-        // Steering input keeps a fraction of grip instead of zeroing it: a binary
-        // release made any A/D touch in a corner an instant, speed-independent flyout.
-        // WITHOUT input the assist also gets only a FRACTION of the grip
-        // (_autoGripFraction): the course generator widens every corner to fit the FULL
-        // grip at the projected speed, so at full auto-grip the ride self-steered every
-        // corner and flyouts never happened hands-off. A fast corner must now be HELD —
-        // steer into it (the steer force supplies the missing centripetal push) or brake.
-        // A closed tube keeps the old fixed rate — the bore contains the body anyway,
-        // and grip-starving the steer there only makes it bang around the walls.
-        float speed = vel.magnitude;
-
-        // CROSS-LANDING CATCH. A body that came back down ACROSS the channel (a jump
-        // that landed mid-curve, a throw over a corner) arrives with the velocity nearly
-        // perpendicular to the path. The grip-capped steer below turns ~1.2 rad/s at ride
-        // speed — a 90° turn takes seconds, and the body crossed the flume and climbed
-        // the far wall long before that. So on the FIRST guided step after a real flight
-        // the arrival angle is measured IN THE CHANNEL PLANE (the fall component must not
-        // count as "crosswise"); a crosswise arrival opens a short window in which the
-        // velocity is rotated onto the path at its own fast rate — bypassing the grip cap,
-        // the capture ramp and the steer input — while the magnitude is fully preserved:
-        // the speed is turned, never cut.
-        if (_crossLandingCheckPending)
-        {
-            _crossLandingCheckPending = false;
-            Vector3 flatVel = Vector3.ProjectOnPlane(vel, guideUp);
-            if (_crossLandingAngle > 0f && flatVel.sqrMagnitude > 1f
-                && Vector3.Angle(flatVel, tangent) > _crossLandingAngle)
-                _crossLandingTimer = _crossLandingMaxTime;
-
-            // TOUCHDOWN SNAP: the velocity vector is set along the path THE MOMENT the
-            // body lands — the full magnitude (fall speed included) becomes ride speed,
-            // nothing is lost crossing the flume or slamming the far wall. The tangent
-            // sign was already resolved above (downhill on a fully crosswise arrival).
-            // The BODY still turns over the catch window below — a model can't snap
-            // its orientation in one frame without a visible pop.
-            // The ride direction is the path tangent LAID INTO the contact surface plane:
-            // the raw tangent can point slightly off the local facet, and a snapped
-            // velocity with an off-surface component reads as a bounce at touchdown.
-            if (_landingAlignVelocity && speed > 1f)
-            {
-                // A big-height fall arrives far above the ride cap; transferring the
-                // whole magnitude into ride speed threw the body off the first convex
-                // bend (the surface drops away faster than gravity can bend a 30+ m/s
-                // trajectory) — read as a bounce. The excess dies in the splash.
-                if (_landingSnapSpeedCap > 0f)
-                    speed = Mathf.Min(speed, Mathf.Max(_landingSnapSpeedCap, _maxSlideSpeed));
-                Vector3 rideDir = Vector3.ProjectOnPlane(tangent, _slideNormalTarget);
-                rideDir = rideDir.sqrMagnitude > 1e-4f ? rideDir.normalized : tangent;
-                // A hard, fast impact often lands on a triangle EDGE and the reported
-                // contact normal is junk (tilted far off the surface); projecting into
-                // that plane aimed the snapped velocity ABOVE the slide — an instant
-                // launch. A normal facet only bends the tangent a few degrees, so a
-                // large bend means a junk normal: ride along the raw tangent instead.
-                if (Vector3.Angle(rideDir, tangent) > 25f)
-                    rideDir = tangent;
-                vel = rideDir * speed;
-            }
-        }
-        bool crossCatch = _crossLandingTimer > 0f;
-
-        if (speed > 1f)
-        {
-            float maxRadians;
-            if (crossCatch)
-            {
-                _crossLandingTimer -= Time.fixedDeltaTime;
-                maxRadians = _crossLandingTurnRate * Time.fixedDeltaTime;
-                // Both the velocity AND the body lie along the path — the job is done,
-                // hand back to the normal ride assist early. (With the touchdown snap
-                // the velocity is aligned from step one; the window then exists for the
-                // body turn, so the body check keeps it open.)
-                Vector3 flatForward = Vector3.ProjectOnPlane(transform.forward, guideUp);
-                if (Vector3.Angle(vel, tangent) < 8f
-                    && (flatForward.sqrMagnitude < 1e-4f || Vector3.Angle(flatForward, tangent) < 10f))
-                    _crossLandingTimer = 0f;
-            }
-            else
-            {
-                bool openFlume = slide.Enclosure == SlideEnclosure.Open;
-                float steerRate = openFlume ? Mathf.Min(_velocitySteer, _corneringGrip / speed) : _velocitySteer;
-                float inputScale = openFlume
-                    ? Mathf.Lerp(_autoGripFraction, _steerGripFraction, Mathf.Clamp01(Mathf.Abs(_slideSteerInput)))
-                    : steerFree;
-                maxRadians = steerRate * catchAssist * inputScale * Time.fixedDeltaTime;
-            }
-            vel = Vector3.RotateTowards(vel / speed, tangent, maxRadians, 0f) * speed;
-        }
-        else
-            _crossLandingTimer = 0f;
-
-        Vector3 right = Vector3.Cross(guideUp, tangent);
+        SampleFrame(frames, _ridePathS, out Vector3 center, out Vector3 tangent, out Vector3 up, out _rideFrameIndex);
+        _lastGuideIndex = _rideFrameIndex;
+        Vector3 right = Vector3.Cross(up, tangent);
         if (right.sqrMagnitude < 1e-6f)
         {
-            _guideRight = Vector3.zero;
-            _rigidbody.linearVelocity = vel;
+            DetachFromSlide(tangent * _rideSpeed, 0.2f);
             return;
         }
         right.Normalize();
 
-        // Published for the A/D slide steer: the frame right stays level with the channel
-        // floor no matter where on the cross-section the body currently is.
-        _guideRight = right;
-        _guideIsOpenFlume = slide.Enclosure == SlideEnclosure.Open;
+        Vector3 gravity = Physics.gravity * GravityMultiplier;
+        bool openFlume = _currentSlide.Enclosure == SlideEnclosure.Open;
 
-        // Measure from the CAPSULE centre, not the rigidbody pivot: the capsule is fitted
-        // to the animated bones and sits away from the pivot.
-        Vector3 bodyCenter = GetBodyCenterWorld();
-        Vector3 offset = bodyCenter - center;
-        float lateral = Vector3.Dot(offset, right);
-        float bodyRadius = GetLateralBodyExtent();
-        float usableHalf = Mathf.Max(halfWidth - bodyRadius, 0.04f);
-        float limit = usableHalf * _boundsLimit;
+        // ---- Скорость вдоль пути: гравитация по касательной + W/S + автотормоз ----
+        float gAlong = Vector3.Dot(gravity, tangent);
+        // На спуске гравитация разгоняет с множителем (просьба 27.10.2026: скорость
+        // вниз по горке должна набираться быстрее); на подъёме тормозит честно.
+        // Множитель только ниже потолка: иначе на крутом спуске он перегонял мягкий
+        // потолок (стекает 10 м/с²), а подскок с перегиба потом срезал 6 м/с разом.
+        float dv = gAlong > 0f && _rideSpeed < MaxRideSpeed ? gAlong * Mathf.Max(_downhillAccelBoost, 1f) : gAlong;
 
-        if (slide.Enclosure == SlideEnclosure.Open)
+        // Ускоряющая полоса: разгон и временно поднятый потолок. Замена газу W —
+        // на телефоне кнопки газа нет, разгон лежит на горке и его надо «собрать».
+        bool onBoost = _currentSlide.IsInBoostStrip(_ridePathS);
+        if (onBoost)
+            _boostTimer = 1f;
+        else if (_boostTimer > 0f)
+            _boostTimer -= dt;
+        float throttle = ThrottleInput;
+        // Без потолка (Max Slide Speed 0) ceiling бесконечен: полоса и газ разгоняют
+        // всегда, мягкий потолок ниже не срабатывает.
+        float ceiling = MaxRideSpeed
+            + (_boostTimer > 0f ? _boostSpeedBonus : 0f)
+            + (throttle > 0.01f ? _throttleSpeedBonus : 0f);
+        if (onBoost && _rideSpeed < ceiling)
+            dv += _boostAcceleration;
+
+        if (throttle > 0.01f && _rideSpeed < ceiling)
+            dv += _throttleAcceleration * throttle;
+        else if (throttle < -0.01f)
+            dv += _brakeAcceleration * throttle; // throttle отрицательный — торможение
+
+        // Автотормоз перед поворотами и трамплином — честный ассист: работает с
+        // силой _autoCornerBrake ВСЕГДА, ввод игрока его не выключает (раньше любой
+        // руль или газ отключали его молча, и игрок не понимал, почему «само ехало
+        // хорошо, а с рулём выносит»). 1 — сам тормозит до безопасной скорости,
+        // меньше — лишь часть, остальное за игроком (тормоз пальцем).
+        if (_autoCornerBrake > 0.001f && _rideSpeed > 6f)
         {
-            // Rim landing whose contact still classified as INNER (the lip normal can
-            // tip either way): same rescue as the collision-side catch — while the
-            // landing window is open, a body over the wall band is put back inside the
-            // channel instead of toppling off the outer side. The containment window
-            // extends this: for _landingContainTime after ANY fresh landing the body
-            // may not leave over a wall at all.
-            if ((_landingNoBounceTimer > 0f || _landingContainTimer > 0f)
-                && Mathf.Abs(lateral) > usableHalf + bodyRadius * 0.5f)
+            float governor = ResolveCornerBrake(frames, _rideFrameIndex, _rideSpeed) * _autoCornerBrake;
+            // Кредитуем торможение, которое подъём уже даёт сам (gAlong < 0).
+            governor += Mathf.Min(gAlong, 0f);
+            if (governor > 0f)
+                dv -= governor;
+        }
+
+        _rideSpeed += dv * dt;
+        ApplyExitBoost(frames, gravity, dt);
+
+        // Пол скорости: гравитация не замедляет ниже минимума (подъёмы), «поток»
+        // докручивает обратно с ограниченным разгоном. Зажатый S может тормозить до
+        // нуля, но задний ход не начинается никогда.
+        float floor = throttle < -0.01f ? 0f : _minRideSpeed;
+        if (_rideSpeed < floor)
+            _rideSpeed = Mathf.MoveTowards(_rideSpeed, floor, 25f * dt);
+        _rideSpeed = Mathf.Max(_rideSpeed, 0f);
+
+        // Мягкий потолок: излишек сверх максимума стекает, а не срезается за кадр.
+        if (_rideSpeed > ceiling)
+            _rideSpeed = Mathf.MoveTowards(_rideSpeed, ceiling, 10f * dt);
+
+        // ---- Отрыв на перегибах (открытый жёлоб) ----
+        // Тело НЕ примагничено к профилю: на выпуклом изломе (резкий уход в спуск,
+        // гребень) поверхность уходит из-под тела быстрее, чем гравитация прижимает —
+        // v²·κ_выпуклая > прижим → отстёгивание в баллистику до следующего касания.
+        if (openFlume)
+        {
+            float convex = MeasureConvexCurvature(frames, _rideFrameIndex, right);
+            if (convex > 1e-3f && _rideSpeed > 1f)
             {
-                float side = Mathf.Sign(lateral);
-                _rigidbody.position += right * (side * usableHalf - lateral);
-                lateral = side * usableHalf;
-                float outwardVel = Vector3.Dot(vel, right) * side;
-                if (outwardVel > 0f)
-                    vel -= right * (side * outwardVel);
+                float needed = _rideSpeed * _rideSpeed * convex;
+                float press = Mathf.Max(-Vector3.Dot(gravity, up), 0.1f) * Mathf.Max(_crestStickiness, 0.05f);
+                if (needed > press)
+                {
+                    _guideTangent = tangent;
+                    _crestHopTimer = 0.7f;
+                    // Тело, только что севшее с подскока и тут же отпущенное перегибом,
+                    // ещё не ехало: оставляем ему его же скорость. Снап на касательную
+                    // кадра (круче полёта на 10–15°) давал рывок 4 м/с за шаг.
+                    DetachFromSlide(_rideTime < 0.05f ? _rigidbody.linearVelocity : ComposeRideVelocity(), 0.1f);
+                    return;
+                }
+            }
+        }
+
+        // ---- Поперечная динамика ----
+        float halfWidth = _currentSlide.RideHalfWidth;
+        float bodyRadius = GetLateralBodyExtent();
+        float lift = (_capsule != null ? _capsule.radius : 0.35f) + _surfaceClearance;
+
+        // Кривизна пути в плоскости кадра (вертикальные изгибы — гребни, петли — не
+        // считаются поворотом). Знак: положительная — путь заворачивает вправо.
+        float curvature = MeasureFlatCurvature(frames, _rideFrameIndex, up);
+        float ck = 1f - Mathf.Exp(-10f * dt);
+        _smoothedCurvature = Mathf.Lerp(_smoothedCurvature, curvature, ck);
+
+        // Центробежное ускорение: поворот вправо выталкивает тело влево.
+        float centrifugal = -_rideSpeed * _rideSpeed * _smoothedCurvature;
+        float gRight = Vector3.Dot(gravity, right);
+        float gPress = Mathf.Max(-Vector3.Dot(gravity, up), 1f); // прижим к полу в раме жёлоба
+
+        bool containment = _landingContainTimer > 0f;
+        Vector3 detachVelocity = Vector3.zero;
+        bool flyOut = false;
+
+        if (openFlume)
+        {
+            float flatHalf = Mathf.Max(halfWidth - bodyRadius, 0.05f);
+            var profile = GetFlumeProfile();
+
+            // Опасность поворота для HUD (см. CornerDanger). Удержание: палец до
+            // упора внутрь компенсирует снос цели на 2·flatHalf/_cornerDriftPerAccel
+            // (≈32 м/с² при ширине пола 1.76 м), а сам скат стенки держит до
+            // gPress·_wallSlope (≈12 м/с²) — берётся большее. Спрос — на текущей
+            // скорости по самому крутому участку в тормозном горизонте.
+            if (_rideSpeed <= _minRideSpeed + 1f)
+                _cornerDanger = 0f;
+            else
+            {
+                float hold = gPress * Mathf.Max(_wallSlope, 0f);
+                if (_cornerDriftPerAccel > 1e-4f)
+                    hold = Mathf.Max(hold, 2f * flatHalf / _cornerDriftPerAccel);
+                else
+                    hold = float.PositiveInfinity; // регулятор держит у пальца с полной силой
+                float demand = MeasureCornerDemandAhead(frames, _rideFrameIndex, _rideSpeed);
+                demand = Mathf.Max(demand, _rideSpeed * _rideSpeed * Mathf.Abs(_smoothedCurvature));
+                _cornerDanger = float.IsInfinity(hold) ? 0f : demand / Mathf.Max(hold, 1f);
             }
 
-            // OVER-GRIP LAUNCH — the flyout mechanic. The flume is barely wider than
-            // the body and its walls are near-vertical: a body over the corner speed
-            // limit does NOT climb out — the wall guides it around like a rail
-            // (unlimited centripetal force from the rigid contact), so no amount of
-            // grip starving can ever produce a flyout by honest drift. The release is
-            // therefore explicit: while the IN-PLANE turn rate of the path demands
-            // more centripetal acceleration than the grip provides (steer input
-            // towards the corner adds the steer force, away from it subtracts), the
-            // wall is doing the holding; after _wallLaunchDelay seconds of that the
-            // channel lets go — the body is popped along the wall just hard enough to
-            // clear the lip (computed from the effective gravity) and its own inertia
-            // carries it over the OUTER side of the corner.
-            if (_wallLaunchDelay > 0f && !crossCatch
-                && _landingNoBounceTimer <= 0f && _landingContainTimer <= 0f
-                && assist >= 0.9f && speed > 6f
-                && Time.fixedTime - _prevGuideTangentTime < Time.fixedDeltaTime * 1.9f)
+            // Ввод A/D: двигает поперёк, но не разгоняет выше своего потолка и не
+            // может затолкать тело выше стенки (наружный ввод на стенке игнорируется).
+            float steerAccel = 0f;
+            if (_hasLateralTarget)
             {
-                // Turn rate around the channel up only: loops and crests bend the
-                // tangent in the VERTICAL plane and must not read as cornering.
-                Vector3 prevFlat = Vector3.ProjectOnPlane(_prevGuideTangent, guideUp);
-                Vector3 curFlat = Vector3.ProjectOnPlane(tangent, guideUp);
-                if (prevFlat.sqrMagnitude > 0.1f && curFlat.sqrMagnitude > 0.1f)
+                // Руль-ползунок: цель = доля ширины пола + ЦЕНТРОБЕЖНЫЙ СНОС. В
+                // повороте цель уезжает наружу на (v²/R + боковая гравитация) ×
+                // _cornerDriftPerAccel, и чтобы остаться в жёлобе, игрок должен «лечь»
+                // пальцем внутрь поворота. Без сноса регулятор держал тело у пальца
+                // силой до Slide Steer Force — больше любой центробежной силы на
+                // трассе, и без руля вылететь было невозможно (28.10.2026).
+                // Снесённая цель заходит за край пола не дальше DriftOverhang: к
+                // стенке тело подходит с ограниченной скоростью, а дальше решает
+                // физика ската (центробежная сила против крутизны стенки и трения).
+                // Палец сам (без сноса) за край пола цель не выводит.
+                float targetRaw = _slideLateralTarget * flatHalf + (centrifugal + gRight) * _cornerDriftPerAccel;
+                float reach = flatHalf + DriftOverhang;
+                float targetL = Mathf.Clamp(targetRaw, -reach, reach);
+                float desiredVel = Mathf.Clamp((targetL - _rideLateral) * _lateralTargetGain, -_maxSlideSteerSpeed, _maxSlideSteerSpeed);
+                steerAccel = ClampSteerAccel((desiredVel - _rideLateralVel) * SteerVelocityGain);
+                bool onWall = Mathf.Abs(_rideLateral) >= flatHalf - 1e-3f;
+                bool aboveFloor = Mathf.Abs(_rideLateral) > flatHalf;
+                // Снесённая цель ушла за край пола в ту же сторону, где тело на
+                // стенке, — регулятор ОТПУСКАЕТ тело целиком (ни наружу, ни назад):
+                // взберётся оно до кромки или сползёт — решает физика ската. Иначе
+                // регулятор тянул бы тело назад к ограниченной цели силой до Slide
+                // Steer Force, и до кромки (≈1.5 м выше края пола) не добраться никогда.
+                bool driftedOut = Mathf.Abs(targetRaw) > flatHalf && Mathf.Sign(targetRaw) == Mathf.Sign(_rideLateral);
+                if (aboveFloor && driftedOut)
+                    steerAccel = 0f;
+                // На стенке руль наружу не помогает инерции (как и раньше).
+                else if (onWall && Mathf.Sign(steerAccel) == Mathf.Sign(_rideLateral))
+                    steerAccel = 0f;
+            }
+            else if (Mathf.Abs(_slideSteerInput) > 0.01f)
+            {
+                bool onWall = Mathf.Abs(_rideLateral) >= flatHalf - 1e-3f;
+                bool pushesOutward = Mathf.Sign(_slideSteerInput) == Mathf.Sign(_rideLateral);
+                if (!(onWall && pushesOutward) && _slideSteerInput * _rideLateralVel < _maxSlideSteerSpeed)
+                    steerAccel = _slideSteerInput * _slideSteerForce;
+            }
+
+            // Частица на кривой сечения y(l): восстановление к ложбине/сопротивление
+            // ската стенки — через наклон dy/dl. На скате стенки трение сильнее
+            // (см. _wallClimbDamping): без него любой всплеск боковой инерции
+            // энергетически перелетал кромку — хватало ~3 м/с поперёк.
+            float slope = SurfaceSlope(_rideLateral, flatHalf, profile);
+            bool onWallBand = Mathf.Abs(_rideLateral) > flatHalf;
+            float dampRate = onWallBand ? _wallClimbDamping : _lateralDamping;
+            float damping = -_rideLateralVel * dampRate;
+            float aExt = centrifugal + gRight + steerAccel + damping;
+            float aLat = (aExt - gPress * slope) / (1f + slope * slope);
+
+            _rideLateralVel += aLat * dt;
+            _rideLateral += _rideLateralVel * dt;
+
+            // Стенка становится «жёсткой» (вылет невозможен), пока скорость не выше
+            // минимума езды: на минимуме держится любой поворот — сбавил скорость,
+            // значит удержался (правило игры). Вылеты начинаются только на скорости,
+            // которую игрок набрал сам (зажатый W, разгон со спуска).
+            bool wallIsRail = containment || _wallSlope <= 0f
+                || _rideSpeed <= _minRideSpeed + 1f;
+            if (wallIsRail)
+            {
+                // Окно удержания после приземления: за борт не выйти, стенка жёсткая.
+                if (Mathf.Abs(_rideLateral) > flatHalf)
                 {
-                    float omega = Vector3.Angle(prevFlat, curFlat) * Mathf.Deg2Rad / Time.fixedDeltaTime;
-                    float needed = speed * omega;
-                    float gripScale = Mathf.Lerp(_autoGripFraction, _steerGripFraction,
-                        Mathf.Clamp01(Mathf.Abs(_slideSteerInput)));
-                    float inwardSign = Mathf.Sign(Vector3.Dot(curFlat - prevFlat, right));
-                    float available = _corneringGrip * gripScale
-                        + _slideSteerInput * inwardSign * _slideSteerForce;
-                    _overGripTimer = needed > available + 0.5f
-                        ? _overGripTimer + Time.fixedDeltaTime
-                        : Mathf.Max(0f, _overGripTimer - 4f * Time.fixedDeltaTime);
-                    // FIRE GATES — the trigger (force balance) stays as is, but the pop
-                    // itself may only fire when it can COMPLETE as a flyout; a pop that
-                    // cannot depart just tosses the body up and drops it back into the
-                    // channel — read exactly as "the side wall kicks me for nothing".
-                    // (1) The body must actually BE on the outer wall: the "wall holds
-                    // like a rail" premise is false mid-channel, where the body is still
-                    // honestly drifting outward and needs no release.
-                    // (2) The corner must KEEP turning ahead: the escape is ballistic
-                    // (the path curves away under the airborne body), so a launch at the
-                    // corner exit has nothing to carry it out. The timer keeps running
-                    // while a gate blocks, so the pop fires the moment both hold.
-                    bool onOuterWall = lateral * inwardSign < -usableHalf * 0.45f;
-                    if (_overGripTimer >= _wallLaunchDelay
-                        && Time.fixedTime - _lastWallLaunchTime > 1.2f
-                        && onOuterWall
-                        && CornerCarriesOutAhead(slide, guideUp, curFlat, inwardSign, speed))
-                    {
-                        _overGripTimer = 0f;
-                        _lastWallLaunchTime = Time.fixedTime;
-                        // PURE vertical pop, no outward push: the body is pressed
-                        // against the OUTER wall, so an outward component points INTO
-                        // the wall — the contact ate it instantly while keeping the
-                        // contact (and the stick press) alive, and the launch stalled
-                        // below the lip (visible as jerking up the wall and back).
-                        // Vertically the escape is free, and the outward part comes by
-                        // itself: the path keeps curving away while the airborne body
-                        // flies straight, so it departs over the lip ballistically.
-                        // CLEARANCE MARGIN — this is the "clean flyout or hold, never a
-                        // stalled push" guarantee. The pop must lift the body clear ABOVE
-                        // the lip and keep it there long enough for the curving path to
-                        // carry it out; a pop that only just reaches the lip is pulled
-                        // straight back by gravity before it departs — read exactly as
-                        // "the edge shoves me up and back". The old +0.35 m / ×1.1 / 0.3 s
-                        // margins were tuned at gravity ×1.8; at ×2 the ballistic return
-                        // is faster, so the same numbers under-clear and the launch
-                        // stalls. Overshoot the lip with room to spare (GravityMultiplier
-                        // already scales the energy, so this stays correct at any weight).
-                        float heightInFrame = Vector3.Dot(offset, guideUp);
-                        float rise = Mathf.Max(slide.FlumeLipHeight + 0.6f - heightInFrame, 0.5f);
-                        float upSpeed = Mathf.Sqrt(2f * Physics.gravity.magnitude * GravityMultiplier * rise) * 1.2f;
-                        vel += guideUp * upSpeed;
-                        // A launch is a real takeoff: suppress the guidance like a
-                        // deliberate jump so the following steps don't steer and damp
-                        // the body straight back into the channel (the suppression
-                        // also mutes the surface stick press — see FixedUpdate).
-                        // Held longer than the old 0.3 s: under gravity ×2 the body needs
-                        // more airtime to clear the lip before the guide can recapture it
-                        // and yank it back inside (the "and back" half of the stall).
-                        _guideSuppressTimer = Mathf.Max(_guideSuppressTimer, 0.45f);
-                    }
+                    _rideLateral = Mathf.Sign(_rideLateral) * flatHalf;
+                    if (Mathf.Sign(_rideLateralVel) == Mathf.Sign(_rideLateral))
+                        _rideLateralVel = 0f;
+                }
+            }
+            else
+            {
+                // Вылет: тело взобралось по скату стенки выше кромки — жёлоб отпускает.
+                float surfaceY = SurfaceHeight(_rideLateral, flatHalf, profile);
+                if (surfaceY >= _currentSlide.FlumeLipHeight)
+                {
+                    float sideSlope = Mathf.Abs(SurfaceSlope(_rideLateral, flatHalf, profile));
+                    float outwardSign = Mathf.Sign(_rideLateral);
+                    float outward = Mathf.Max(Mathf.Abs(_rideLateralVel), _flyoutMinOutwardSpeed) * Mathf.Max(_flyoutOutwardBoost, 0.1f);
+                    detachVelocity = tangent * _rideSpeed
+                        + right * (outwardSign * outward)
+                        + up * (Mathf.Abs(_rideLateralVel) * sideSlope);
+                    flyOut = true;
                 }
             }
 
-            // Soft feel-assists only: damp the side-to-side oscillation and drift back
-            // towards the centreline while inside the channel. The walls hold the body
-            // geometrically, and enough speed legitimately climbs and clears them.
-            // Muted during the cross-landing catch: the damper would EAT the crosswise
-            // speed (magnitude loss), while the catch must TURN it along the path intact.
-            if (!crossCatch)
+            if (flyOut)
             {
-                float lateralVel = Vector3.Dot(vel, right);
-                _rigidbody.AddForce(right * (-lateralVel * _lateralDamping * catchAssist * steerFree), ForceMode.Acceleration);
-                // The centreline pull must not act as EXTRA grip: in a corner the grip
-                // model has already lost, the pull (up to _centeringAccel at the band
-                // edge) quietly supplied the missing centripetal force and held corners
-                // the reduced auto-grip was meant to lose. Detected via the steer lag:
-                // while the steer keeps up, the velocity trails the path by ~1° per
-                // step; a saturated steer lets the lag grow, so fade the pull out over
-                // 4°→8° of lag and let the drift carry the body up the outer wall.
-                float driftFree = 1f - Mathf.Clamp01((Vector3.Angle(vel, tangent) - 4f) / 4f);
-                if (_centeringAccel > 0f && Mathf.Abs(lateral) < limit)
-                    _rigidbody.AddForce(right * (-lateral * _centeringAccel * assist * steerFree * driftFree), ForceMode.Acceleration);
+                // Кромка не должна ловить вылетающее тело: капсула на высоте кромки
+                // цепляла бортик коллайдера изнутри, скользила по нему, теряла
+                // скорость и падала обратно в жёлоб («край отталкивает»). На время
+                // полёта коллайдер этой горки для капсулы отключается, а тело
+                // приподнимается над бортиком.
+                IgnoreSlideCollision(_currentSlide, Mathf.Max(_flyoutSuppression, 0.3f));
+                _rigidbody.position += up * (_capsule != null ? _capsule.radius : 0.35f) * 0.8f
+                    + right * (Mathf.Sign(_rideLateral) * 0.15f);
+                DetachFromSlide(detachVelocity, Mathf.Max(_flyoutSuppression, _jumpGuideSuppression));
+                return;
             }
 
-            // Published every guided open-flume step: the turn-rate probe for the
-            // over-grip launch above, and the rim plane for the camera (a point at
-            // lip-top level, plane normal = channel up) so it can proactively stay
-            // above the channel rim on banked corners.
-            _prevGuideTangent = tangent;
-            _prevGuideTangentTime = Time.fixedTime;
-            _rimPlanePoint = center + guideUp * slide.FlumeLipHeight;
-            _rimPlaneUp = guideUp;
+            // ---- Целевая поза (жёлоб) ----
+            // Видимая поза — на РЕАЛЬНОЙ поверхности сечения (дно/эллипс стенки), со
+            // смещением по её нормали, а не по виртуальному скату физики: пока тело
+            // лезет по стенке, оно прижато к ней и наклонено по стенке, доходит до
+            // верха кромки ровно в момент вылета. Так игрок видит, насколько близок
+            // вылет, а тело не висит в воздухе у кромки.
+            ComputeVisualPose(_rideLateral, flatHalf, profile, _currentSlide.FlumeLipHeight,
+                out float visualLateral, out float visualY, out Vector2 n2);
+            Vector3 surfaceNormal = (right * n2.x + up * n2.y).normalized;
+            float poseLateral = visualLateral + n2.x * lift;
+            float poseHeight = visualY + n2.y * lift;
+
+            if (!AdvanceAndDrive(frames, dt, poseLateral, poseHeight, surfaceNormal))
+                return;
+
+            // Публикация для камеры.
+            _rimPlanePoint = center + up * _currentSlide.FlumeLipHeight;
+            _rimPlaneUp = up;
             _hasRimPlane = true;
+            _flumeCenterPoint = center;
         }
         else
         {
+            // Закрытая труба: маятник на окружности сечения. Вылет невозможен —
+            // держит сама труба.
+            _cornerDanger = 0f;
+            float rEff = Mathf.Max(halfWidth - lift, 0.1f);
+
+            float steerAccel = 0f;
+            if (_hasLateralTarget)
+            {
+                // Ползунок в трубе: цель — угол на сечении до ±60° от дна, плюс тот же
+                // центробежный снос наружу (в дуге сечения), что и в открытом жёлобе.
+                float driftAngle = centrifugal * _cornerDriftPerAccel / rEff;
+                float targetAngle = Mathf.Clamp(_slideLateralTarget * (Mathf.PI / 3f) + driftAngle, -Mathf.PI * 0.5f, Mathf.PI * 0.5f);
+                float desiredVel = Mathf.Clamp((targetAngle - _tubeAngle) * rEff * _lateralTargetGain, -_maxSlideSteerSpeed, _maxSlideSteerSpeed);
+                steerAccel = ClampSteerAccel((desiredVel - _tubeAngularVel * rEff) * SteerVelocityGain);
+            }
+            else if (Mathf.Abs(_slideSteerInput) > 0.01f
+                && _slideSteerInput * (_tubeAngularVel * rEff) < _maxSlideSteerSpeed)
+                steerAccel = _slideSteerInput * _slideSteerForce;
+
+            // Направление вдоль окружности в текущей точке сечения.
+            Vector3 tdir = right * Mathf.Cos(_tubeAngle) + up * Mathf.Sin(_tubeAngle);
+            Vector3 external = right * (centrifugal + steerAccel) + gravity;
+            float aTangential = Vector3.Dot(external, tdir) - _tubeAngularVel * rEff * _lateralDamping;
+
+            _tubeAngularVel += aTangential / rEff * dt;
+            _tubeAngle += _tubeAngularVel * dt;
+
+            Vector3 radial = right * Mathf.Sin(_tubeAngle) - up * Mathf.Cos(_tubeAngle);
+            Vector3 surfaceNormal = -radial;
+
             _hasRimPlane = false;
-
-            // Closed tube: the mesh collider owns containment. Only damp the pendulum
-            // swing around the ring so the body doesn't oscillate wall-to-wall forever;
-            // the forward speed is untouched.
-            float height = Vector3.Dot(offset, guideUp);
-            Vector2 q = new(lateral, height);
-            float qLen = q.magnitude;
-            if (qLen > 1e-4f)
-            {
-                Vector3 radial = right * (q.x / qLen) + guideUp * (q.y / qLen);
-
-                // ESCAPE NET, not a magnet: a CONTACTING body whose centre is deeper
-                // into the tube wall than half a body radius is impossible in normal
-                // riding (the solver keeps penetration to centimetres) — it is mid-
-                // squeeze through the shell (a corner crash pressed it in until
-                // depenetration was about to pop it out the FAR side). Put it back
-                // against the inner surface and strip the outward speed. Runs only
-                // under slide contact, so a flyer near the tube mouth (no contact,
-                // no guide forces) can never be teleported in by this.
-                float escapeRadius = halfWidth - bodyRadius * 0.5f;
-                if (qLen > escapeRadius)
-                {
-                    Vector3 targetCenter = center + radial * Mathf.Max(halfWidth - bodyRadius, 0.05f);
-                    _rigidbody.position += targetCenter - bodyCenter;
-                    float outward = Vector3.Dot(vel, radial);
-                    if (outward > 0f)
-                        vel -= radial * outward;
-                }
-
-                // The pendulum damper is muted during the cross-landing catch for the
-                // same reason as the open-flume dampers: turn the speed, don't eat it.
-                Vector3 around = Vector3.Cross(tangent, radial);
-                if (!crossCatch && around.sqrMagnitude > 1e-6f)
-                {
-                    around.Normalize();
-                    _rigidbody.AddForce(around * (-Vector3.Dot(vel, around) * _lateralDamping * assist * steerFree), ForceMode.Acceleration);
-                }
-            }
+            AdvanceAndDriveTube(frames, dt, rEff, surfaceNormal);
         }
-
-        // Speed cap while riding — uncapped speed is what loses corners (and makes the
-        // CCD sweeps against the tube meshes expensive). Ramped like the rest so a fast
-        // arrival is not clipped on first touch.
-        float guidedSpeed = vel.magnitude;
-        if (guidedSpeed > _maxSlideSpeed)
-            vel *= Mathf.Lerp(1f, _maxSlideSpeed / guidedSpeed, assist);
-
-        _rigidbody.linearVelocity = vel;
     }
 
-    // Whether the corner KEEPS turning the same way far enough ahead for a wall
-    // launch to depart. The pop is purely vertical: the outward escape only comes
-    // from the path curving away under the airborne body, so a pop fired near the
-    // corner EXIT (the path straightens right after) just hops up and drops back
-    // into the channel — read as the side wall kicking the player for nothing.
-    // Walk the ride frames over the distance the first half-second of flight covers
-    // (that is what carries the body over the lip) and require the path to keep
-    // turning the SAME way by enough to open a body-wide gap (~12°: at ride speed
-    // the lateral gap s·θ/2 is then well past the capsule radius).
-    bool CornerCarriesOutAhead(WaterSlideGenerator slide, Vector3 guideUp, Vector3 curFlat, float inwardSign, float speed)
+    // Продвигает s, семплирует новый кадр и ведёт тело к целевой позе через velocity
+    // (жёлоб). Сход с конца пути — честный отрыв в баллистику. Возвращает false,
+    // если тело отстегнулось.
+    bool AdvanceAndDrive(IReadOnlyList<WaterSlideMeshBuilder.RideFrame> frames, float dt,
+        float lateral, float heightAboveFrame, Vector3 surfaceNormal)
     {
-        var frames = slide.RideFrames;
-        if (frames == null || frames.Count < 2)
-            return false;
-
-        int i = Mathf.Clamp(_lastGuideIndex, 0, frames.Count - 1);
-        // Frames are ordered along the path; the tangent may be riding them in
-        // reverse (the sign flip in GuideAlongSlide), so walk in the riding direction.
-        float dirDot = Vector3.Dot(_smoothedGuideTangent, frames[i].Forward);
-        int dir = dirDot >= 0f ? 1 : -1;
-
-        float lookahead = Mathf.Max(speed * 0.45f, 4f);
-        float travelled = 0f;
-        int j = i;
-        while (j + dir >= 0 && j + dir < frames.Count && travelled < lookahead)
+        _ridePathS += _rideSpeed * dt;
+        if (_ridePathS >= _cumLengths[^1])
         {
-            travelled += Vector3.Distance(frames[j].Position, frames[j + dir].Position);
-            j += dir;
+            _landingAssistSlide = NextSlide;
+            _landingAssistJumped = false;
+            DetachFromSlide(ComposeRideVelocity(), 0.25f);
+            return false;
         }
 
-        Vector3 aheadFlat = Vector3.ProjectOnPlane(frames[j].Forward * dir, guideUp);
-        if (aheadFlat.sqrMagnitude < 0.01f)
-            return false;
+        SampleFrame(frames, _ridePathS, out Vector3 center, out Vector3 tangent, out Vector3 up, out _rideFrameIndex);
+        Vector3 right = Vector3.Cross(up, tangent).normalized;
 
-        // Positive SignedAngle around guideUp bends the tangent toward the frame
-        // right — the same convention inwardSign was measured with, so the product
-        // is positive only when the path ahead keeps turning INTO the same corner.
-        float turnAhead = Vector3.SignedAngle(curFlat, aheadFlat, guideUp);
-        return turnAhead * inwardSign >= 12f;
-    }
-
-    WaterSlideGenerator ResolveGuideSlide()
-    {
-        // While the current slide still yields a valid guide frame, never re-pick another
-        // one: switching mid-ride (e.g. another tube passing near a corner) moves the
-        // containment to the OTHER tube, and escaping the current one becomes "legal".
-        // Tracked search: the windowed lookup around the last index is ~20x cheaper than
-        // the full-path scan, and this runs every physics step.
-        if (_guideWasActive
-            && _currentSlide != null
-            && TryGetGuideFrameOnSlide(_currentSlide, out _, out _, out _, out _, out _))
-            return _currentSlide;
-
-        if (_course != null && _course.Slides.Count > 0)
-        {
-            if (TryPickGuideSlide(_course.Slides, out var best))
-                return best;
-            return null;
-        }
-
-        return _currentSlide;
-    }
-
-    bool TryPickGuideSlide(IReadOnlyList<WaterSlideGenerator> slides, out WaterSlideGenerator best)
-    {
-        best = null;
-        float bestDist = float.MaxValue;
-
-        for (int i = 0; i < slides.Count; i++)
-        {
-            var slide = slides[i];
-            if (slide == null)
-                continue;
-
-            if (!TryGetGuideFrameOnSlide(slide, out _, out _, out _, out float halfWidth, out float pathDist, trackGuideIndex: false))
-                continue;
-
-            float score = pathDist + halfWidth * 0.15f;
-
-            // Sticky choice: switching the guide mid-ride resets the smoothed tangent and
-            // shows up as a kick, so the current slide keeps a preference margin.
-            if (slide == _currentSlide)
-                score *= 0.7f;
-
-            if (score >= bestDist)
-                continue;
-
-            bestDist = score;
-            best = slide;
-        }
-
-        return best != null;
-    }
-
-    bool TryGetGuideFrameOnSlide(
-        WaterSlideGenerator slide,
-        out Vector3 center,
-        out Vector3 tangent,
-        out Vector3 up,
-        out float halfWidth) =>
-        TryGetGuideFrameOnSlide(slide, out center, out tangent, out up, out halfWidth, out _);
-
-    bool TryGetGuideFrameOnSlide(
-        WaterSlideGenerator slide,
-        out Vector3 center,
-        out Vector3 tangent,
-        out Vector3 up,
-        out float halfWidth,
-        out float pathDistance,
-        bool trackGuideIndex = true)
-    {
-        center = default;
-        tangent = default;
-        up = Vector3.up;
-        halfWidth = 0f;
-        pathDistance = float.MaxValue;
-
-        if (slide == null)
-            return false;
-
-        var frames = slide.RideFrames;
-        if (frames == null || frames.Count < 2)
-            return false;
-
-        // Capture/release distances are measured from the capsule centre so they agree
-        // with the containment geometry in GuideAlongSlide.
-        Vector3 pos = GetBodyCenterWorld();
-
-        // Search around the last known index; the rider moves continuously along the path.
-        int start = 0, end = frames.Count - 1;
-        if (trackGuideIndex && slide == _currentSlide && _lastGuideIndex >= 0 && _lastGuideIndex < frames.Count)
-        {
-            // ±40 frames ≈ ±5 m at the current ring spacing — the same physical window
-            // the old ±15 covered before the rings were densified.
-            start = Mathf.Max(0, _lastGuideIndex - 40);
-            end = Mathf.Min(frames.Count - 1, _lastGuideIndex + 40);
-        }
-
-        int best = FindNearestFrame(frames, pos, start, end);
-        float bodyRadius = GetLateralBodyExtent();
-
-        // Fall back to a full search only when the windowed result is genuinely lost (not
-        // just at the window edge): on self-intersecting paths (loops) the global nearest
-        // frame can belong to the OTHER branch, and jumping there flips the containment.
-        if ((best == start || best == end)
-            && Vector3.Distance(frames[best].Position, pos) > slide.RideHalfWidth + bodyRadius + 0.6f)
-            best = FindNearestFrame(frames, pos, 0, frames.Count - 1);
-
-        if (trackGuideIndex)
-            _lastGuideIndex = best;
-
-        var frame = frames[best];
-
-        // Hysteresis: capture close to the centreline, but once guided release much
-        // farther out — otherwise one hard bump past the capture radius turned the
-        // containment off entirely and the body sailed away from the tube.
-        float reach = Mathf.Max(_guideCaptureDistance, 0.5f);
-        if (_guideWasActive && slide == _currentSlide)
-            reach = Mathf.Max(reach, _guideReleaseDistance);
-
-        float maxGuideDistance = slide.RideHalfWidth + bodyRadius + reach;
-        pathDistance = Vector3.Distance(frame.Position, pos);
-        if (pathDistance > maxGuideDistance)
-            return false;
-
-        // Past the end (or before the entrance) the rider is on a legitimate flight to the
-        // next slide — guidance must release him, not drag him back.
-        Vector3 endTangent = frame.Forward.sqrMagnitude > 1e-6f ? frame.Forward.normalized : transform.forward;
-        float along = Vector3.Dot(pos - frame.Position, endTangent);
-        if (best == frames.Count - 1 && along > 0.5f)
-            return false;
-        if (best == 0 && along < -0.5f)
-            return false;
-
-        // Project onto the neighbouring segment so the centre doesn't hop between samples.
-        int next = Mathf.Min(best + 1, frames.Count - 1);
-        int prev = Mathf.Max(best - 1, 0);
-        Vector3 segStart = frames[prev].Position;
-        Vector3 segEnd = frames[next].Position;
-        Vector3 seg = segEnd - segStart;
-        float t = seg.sqrMagnitude > 1e-6f
-            ? Mathf.Clamp01(Vector3.Dot(pos - segStart, seg) / seg.sqrMagnitude)
-            : 0f;
-
-        center = segStart + seg * t;
-
-        // Interpolate the frame across the segment as well: taking tangent/up from the
-        // nearest sample makes them step every ~0.3 m, and each step kicks the steering.
-        Vector3 tanBlend = Vector3.Slerp(frames[prev].Forward, frames[next].Forward, t);
-        tangent = tanBlend.sqrMagnitude > 1e-6f
-            ? tanBlend.normalized
-            : (frame.Forward.sqrMagnitude > 1e-6f ? frame.Forward.normalized : transform.forward);
-        Vector3 upBlend = Vector3.Slerp(frames[prev].Up, frames[next].Up, t);
-        up = upBlend.sqrMagnitude > 1e-6f ? upBlend.normalized : frame.Up;
-        halfWidth = slide.RideHalfWidth;
-        pathDistance = Vector3.Distance(center, pos);
-
-        // An open flume may not CAPTURE a body outside its channel. Under the floor the
-        // air recovery pulled the player up against the slide's belly; sideways past the
-        // walls (below the wall top) the containment pinned him to the OUTER wall — both
-        // dragged him along the course. An ACTIVE guide keeps wider margins so escape
-        // recovery near the boundary still works; the initial drop is exempt entirely.
-        if (slide.Enclosure == SlideEnclosure.Open && _hasSlideContactSinceSpawn)
-        {
-            bool activeGuide = _guideWasActive && slide == _currentSlide;
-            Vector3 offsetFromCenter = pos - center;
-
-            float heightInFrame = Vector3.Dot(offsetFromCenter, up);
-            if (heightInFrame < -(slide.FlumeDepth + (activeGuide ? 0.45f : 0.25f)))
-                return false;
-
-            // Above the wall top the body may legitimately be descending INTO the
-            // channel — only reject lateral positions below the lip level.
-            Vector3 rightAxis = Vector3.Cross(up, tangent);
-            if (rightAxis.sqrMagnitude > 1e-6f && heightInFrame < slide.FlumeLipHeight + 0.1f)
-            {
-                float lateral = Mathf.Abs(Vector3.Dot(offsetFromCenter, rightAxis.normalized));
-                if (lateral > halfWidth + GetLateralBodyExtent() + (activeGuide ? 0.75f : 0.3f))
-                    return false;
-            }
-        }
-
-        // A closed tube may only CAPTURE a body that is inside its bore. Flights between
-        // slides pass within metres of other tubes (and of the just-exited one), and a
-        // distance-only capture glued the body onto the tube EXTERIOR. An already active
-        // guide is exempt (escape recovery must keep working), as is the initial drop.
-        if (slide.Enclosure != SlideEnclosure.Open
-            && _hasSlideContactSinceSpawn
-            && !(_guideWasActive && slide == _currentSlide))
-        {
-            Vector3 radialOffset = pos - center;
-            radialOffset -= tangent * Vector3.Dot(radialOffset, tangent);
-            if (radialOffset.magnitude > halfWidth)
-            {
-                // Exception — the MOUTH of the tube: an arriving jump legitimately closes
-                // in from outside the bore. Only within the first few rings, only close,
-                // only moving along the tube, and only while still AT the entrance plane —
-                // a body already alongside the first metres of the tube is flying past it,
-                // and capturing it glued the player to the tube exterior.
-                Vector3 vel = _rigidbody.linearVelocity;
-                Vector3 entryForward = frames[0].Forward.sqrMagnitude > 1e-6f
-                    ? frames[0].Forward.normalized
-                    : tangent;
-                float alongFromMouth = Vector3.Dot(pos - frames[0].Position, entryForward);
-                bool arrivingAtMouth = best <= 30
-                    && alongFromMouth < 1f
-                    && radialOffset.magnitude <= halfWidth + 1f
-                    && vel.sqrMagnitude > 1f
-                    && Vector3.Dot(vel.normalized, tangent) > 0.35f;
-                if (!arrivingAtMouth)
-                    return false;
-            }
-        }
-
+        Vector3 targetCenter = center + right * lateral + up * heightAboveFrame;
+        DriveBodyTo(targetCenter, tangent, surfaceNormal);
         return true;
+    }
+
+    void AdvanceAndDriveTube(IReadOnlyList<WaterSlideMeshBuilder.RideFrame> frames, float dt,
+        float rEff, Vector3 surfaceNormal)
+    {
+        _ridePathS += _rideSpeed * dt;
+        if (_ridePathS >= _cumLengths[^1])
+        {
+            _landingAssistSlide = NextSlide;
+            _landingAssistJumped = false;
+            DetachFromSlide(ComposeRideVelocity(), 0.25f);
+            return;
+        }
+
+        SampleFrame(frames, _ridePathS, out Vector3 center, out Vector3 tangent, out Vector3 up, out _rideFrameIndex);
+        Vector3 right = Vector3.Cross(up, tangent).normalized;
+        Vector3 radial = right * Mathf.Sin(_tubeAngle) - up * Mathf.Cos(_tubeAngle);
+
+        Vector3 targetCenter = center + radial * rEff;
+        DriveBodyTo(targetCenter, tangent, surfaceNormal);
+    }
+
+    // Скорость тела, соответствующая текущему состоянию путевой модели (для отрыва).
+    Vector3 ComposeRideVelocity()
+    {
+        Vector3 tangent = _guideTangent.sqrMagnitude > 1e-6f ? _guideTangent : transform.forward;
+        Vector3 vel = tangent * _rideSpeed;
+        if (_currentSlide != null && _currentSlide.Enclosure == SlideEnclosure.Open)
+        {
+            Vector3 up = _slideNormal;
+            Vector3 right = Vector3.Cross(up, tangent);
+            if (right.sqrMagnitude > 1e-6f)
+                vel += right.normalized * _rideLateralVel;
+        }
+        return vel;
+    }
+
+    // Ведение тела к целевой позе ЧЕРЕЗ скорость: рендер интерполирует движение как
+    // физическое, а ошибки позиции самокорректируются каждый шаг.
+    void DriveBodyTo(Vector3 targetBodyCenter, Vector3 tangent, Vector3 surfaceNormal)
+    {
+        _guideTangent = tangent;
+        _slideNormalTarget = surfaceNormal;
+
+        float k = 1f - Mathf.Exp(-_normalSmoothing * Time.fixedDeltaTime);
+        _slideNormal = Vector3.Slerp(_slideNormal, _slideNormalTarget, k).normalized;
+
+        var targetRot = Quaternion.LookRotation(
+            Vector3.ProjectOnPlane(tangent, _slideNormal).sqrMagnitude > 1e-6f
+                ? Vector3.ProjectOnPlane(tangent, _slideNormal).normalized
+                : tangent,
+            _slideNormal);
+
+        // Смещение центра капсулы — по ТЕКУЩЕМУ повороту тела, не по целевому:
+        // linearVelocity двигает центр масс (= центр капсулы), а пивот ходит за
+        // поворотом сам. С целевым поворотом при смене наклона на перегибе (30–40°)
+        // пивот «промахивался» на 0.7 м, коррекция выдавала +6 м/с, а центр тела
+        // съезжал с пути, пока тело доворачивалось, — рывок камеры (27.10.2026).
+        Vector3 capsuleOffset = _capsule != null ? _rigidbody.rotation * _capsule.center : Vector3.zero;
+        Vector3 targetRbPos = targetBodyCenter - capsuleOffset;
+
+        // Скорость = движение вдоль пути + ОГРАНИЧЕННАЯ коррекция промаха позиции.
+        // Без капа промах пристёгивания (~0.3–0.5 м в момент приземления) выдавал
+        // одношаговый рывок скорости в десятки м/с — видимый дёрг. С капом остаток
+        // рассасывается за несколько шагов плавно.
+        Vector3 delta = targetRbPos - _rigidbody.position;
+        Vector3 pathStep = ComposeRideVelocity() * Time.fixedDeltaTime;
+        Vector3 correction = delta - pathStep;
+        // Мелкий промах слежения (сантиметры у швов) гасится за шаг — иначе тело
+        // ложится на коллайдер и его пинает выталкивание. Крупный (после подскока
+        // или посадки, 0.1–0.5 м) — пропорционально промаху, не быстрее 2.5 м/с на
+        // малом и ~15·промах на большом: прежний кап 8 м/с гасил 16 см за ОДИН шаг —
+        // рывок 7 м/с на каждом перегибе (27.10.2026).
+        float dt = Time.fixedDeltaTime;
+        float miss = correction.magnitude;
+        // Крупный промах при пристёгивании на перегибе — в основном от разворота
+        // тела (пивот у ног, центр капсулы ~1 м от него: поворот на 30° = 0.5 м);
+        // он рассасывается, пока тело доворачивается, гнать его быстро незачем.
+        float corrSpeed = Mathf.Min(miss / dt, Mathf.Clamp(miss * 8f, 2.5f, 6f));
+        if (miss > 1e-5f)
+            correction = correction / miss * (corrSpeed * dt);
+
+        _rigidbody.WakeUp();
+        _rigidbody.linearVelocity = (pathStep + correction) / dt;
+
+        // Направление полёта на случай отрыва — горизонтальная проекция касательной.
+        Vector3 flat = Vector3.ProjectOnPlane(tangent, Vector3.up);
+        if (flat.sqrMagnitude > 1e-4f)
+            _flightHeading = flat.normalized;
+    }
+
+    // ---- Профиль сечения открытого жёлоба ----
+
+    struct FlumeProfile
+    {
+        public float Depth;
+        public float HalfWidth;
+        public bool Rounded;
+    }
+
+    FlumeProfile GetFlumeProfile() => new()
+    {
+        Depth = _currentSlide.FlumeDepth,
+        HalfWidth = Mathf.Max(_currentSlide.RideHalfWidth, 0.1f),
+        Rounded = _currentSlide.OpenShape == OpenFlumeShape.Rounded
+    };
+
+    // Высота поверхности сечения (в раме кадра: 0 — основание борта, пол на -Depth)
+    // в точке поперечного смещения l. За пределами полосы пола — виртуальный скат
+    // стенки крутизной _wallSlope, по которому инерция может вынести тело за кромку.
+    float SurfaceHeight(float l, float flatHalf, in FlumeProfile p)
+    {
+        float a = Mathf.Abs(l);
+        float baseY;
+        if (p.Rounded)
+        {
+            float x = Mathf.Clamp01(Mathf.Min(a, flatHalf) / p.HalfWidth);
+            baseY = -p.Depth * Mathf.Sqrt(Mathf.Max(1f - x * x, 0f));
+        }
+        else
+            baseY = -p.Depth;
+
+        if (a <= flatHalf)
+            return baseY;
+
+        return baseY + (a - flatHalf) * Mathf.Max(_wallSlope, 0.1f);
+    }
+
+    // Высота РЕАЛЬНОЙ поверхности сечения (дно или эллипс стенки) на |l| = a.
+    static float RealSurfaceHeight(float a, in FlumeProfile p)
+    {
+        if (!p.Rounded)
+            return -p.Depth;
+        float x = Mathf.Clamp(a / p.HalfWidth, 0f, 0.995f);
+        return -p.Depth * Mathf.Sqrt(Mathf.Max(1f - x * x, 0f));
+    }
+
+    // Внутренняя нормаль реальной поверхности в точке |l| = a (x — наружу, y — вверх).
+    static Vector2 RealSurfaceNormal(float a, in FlumeProfile p)
+    {
+        if (!p.Rounded)
+            return Vector2.up;
+        float y = RealSurfaceHeight(a, p);
+        float x = Mathf.Min(a, p.HalfWidth * 0.995f);
+        // Градиент эллипса (x/a², y/b²) смотрит наружу; внутренняя нормаль — минус он.
+        var n = new Vector2(-x / (p.HalfWidth * p.HalfWidth), -y / (p.Depth * p.Depth));
+        return n.sqrMagnitude > 1e-8f ? n.normalized : Vector2.up;
+    }
+
+    // Видимая поза тела по физическому поперечному смещению l: на полосе пола —
+    // точка реальной поверхности; на «скате» (|l| > flatHalf) — прямая от края пола
+    // к верху кромки, пройденная на ту же долю, что и физический подъём до порога
+    // вылета (y_phys от края пола до LipHeight). Нормаль — реальной стенки.
+    void ComputeVisualPose(float l, float flatHalf, in FlumeProfile p, float lipHeight,
+        out float x, out float y, out Vector2 normal)
+    {
+        float a = Mathf.Abs(l);
+        float sign = l >= 0f ? 1f : -1f;
+
+        if (a <= flatHalf)
+        {
+            x = a;
+            y = RealSurfaceHeight(a, p);
+            normal = RealSurfaceNormal(a, p);
+        }
+        else
+        {
+            float yEdge = SurfaceHeight(flatHalf, flatHalf, p);
+            float yPhys = SurfaceHeight(a, flatHalf, p);
+            float t = Mathf.Clamp01((yPhys - yEdge) / Mathf.Max(lipHeight - yEdge, 0.05f));
+            x = Mathf.Lerp(flatHalf, p.HalfWidth, t);
+            y = Mathf.Lerp(RealSurfaceHeight(flatHalf, p), lipHeight, t);
+            // К кромке тело поднимается над бортиком (центр капсулы выше его верха),
+            // наклон к стенке умеренный: полностью горизонтальная нормаль клала тело
+            // на бок и читалась как «разворачивает».
+            y += t * t * 0.35f;
+            normal = Vector2.Lerp(RealSurfaceNormal(x, p), new Vector2(-0.55f, 0.83f).normalized, t * t).normalized;
+        }
+
+        x *= sign;
+        normal.x *= sign;
+    }
+
+    // Наклон dy/dl той же кривой (со знаком поперечного направления).
+    float SurfaceSlope(float l, float flatHalf, in FlumeProfile p)
+    {
+        float a = Mathf.Abs(l);
+        float sign = l >= 0f ? 1f : -1f;
+
+        if (a > flatHalf)
+            return sign * Mathf.Max(_wallSlope, 0.1f);
+
+        if (!p.Rounded)
+            return 0f;
+
+        float x = Mathf.Clamp(a / p.HalfWidth, 0f, 0.99f);
+        // y = -D·√(1-x²) → dy/da = D·x / (HW·√(1-x²))
+        float slope = p.Depth * x / (p.HalfWidth * Mathf.Sqrt(1f - x * x));
+        return sign * slope;
+    }
+
+    // Выпуклая кривизна профиля вдоль пути около индекса i, рад/м; >0 — касательная
+    // заворачивает вниз (поверхность уходит из-под тела). Меряется вокруг оси right,
+    // боковые повороты (yaw) на неё не влияют.
+    static float MeasureConvexCurvature(IReadOnlyList<WaterSlideMeshBuilder.RideFrame> frames, int i, Vector3 right)
+    {
+        const int Span = 4;
+        int a = Mathf.Max(i - Span, 0);
+        int b = Mathf.Min(i + Span, frames.Count - 1);
+        if (b - a < 2)
+            return 0f;
+
+        Vector3 fa = Vector3.ProjectOnPlane(frames[a].Forward, right);
+        Vector3 fb = Vector3.ProjectOnPlane(frames[b].Forward, right);
+        if (fa.sqrMagnitude < 0.01f || fb.sqrMagnitude < 0.01f)
+            return 0f;
+
+        float dist = Vector3.Distance(frames[a].Position, frames[b].Position);
+        if (dist < 0.05f)
+            return 0f;
+
+        return Vector3.SignedAngle(fa, fb, right) * Mathf.Deg2Rad / dist;
+    }
+
+    // Кривизна пути в плоскости кадра около индекса i, рад/м; >0 — поворот вправо.
+    static float MeasureFlatCurvature(IReadOnlyList<WaterSlideMeshBuilder.RideFrame> frames, int i, Vector3 up)
+    {
+        // Окно ~±0.6 м при шаге колец 0.12–0.22 м.
+        const int Span = 4;
+        int a = Mathf.Max(i - Span, 0);
+        int b = Mathf.Min(i + Span, frames.Count - 1);
+        if (b - a < 2)
+            return 0f;
+
+        Vector3 fa = Vector3.ProjectOnPlane(frames[a].Forward, up);
+        Vector3 fb = Vector3.ProjectOnPlane(frames[b].Forward, up);
+        if (fa.sqrMagnitude < 0.01f || fb.sqrMagnitude < 0.01f)
+            return 0f;
+
+        float dist = Vector3.Distance(frames[a].Position, frames[b].Position);
+        if (dist < 0.05f)
+            return 0f;
+
+        return Vector3.SignedAngle(fa, fb, up) * Mathf.Deg2Rad / dist;
+    }
+
+    // Наибольшее центробежное ускорение v²·κ (м/с²), которое ждёт тело в поворотах
+    // впереди в горизонте «тормозной путь + 6 м, не меньше 2 с хода» (тот же обход
+    // чанками ~1.2 м в плоскости кадра, что и у автотормоза). Скорость в точке
+    // поворота ПРОГНОЗИРУЕТСЯ по энергии спуска до неё (v² + 2·g·перепад; подъём
+    // гасит не ниже минимума езды): на спуске тело набирает с 16 до 23 м/с за
+    // секунду, и по текущей скорости красный загорался лишь за секунду до вылета
+    // (замер 29.10.2026). Автотормоз 0.6 и трение в прогнозе не учтены (журнал:
+    // на спусках они скорость почти не сбивают). Для подкраски скорости в HUD.
+    float MeasureCornerDemandAhead(IReadOnlyList<WaterSlideMeshBuilder.RideFrame> frames, int startIndex, float speed)
+    {
+        float lookahead = Mathf.Max(speed * speed / (2f * Mathf.Max(_brakeAcceleration, 1f)) + 6f, speed * 2f);
+        lookahead = Mathf.Min(lookahead, 60f);
+        float gEff = Physics.gravity.magnitude * GravityMultiplier;
+        float minSq = _minRideSpeed * _minRideSpeed;
+        float demand = 0f;
+        float travelled = 0f;
+        float chunkDist = 0f;
+        int i = Mathf.Clamp(startIndex, 0, frames.Count - 1);
+        float y0 = frames[i].Position.y;
+        Vector3 chunkStartFwd = frames[i].Forward;
+        int j = i;
+        while (j + 1 < frames.Count && travelled < lookahead)
+        {
+            float step = Vector3.Distance(frames[j].Position, frames[j + 1].Position);
+            j++;
+            travelled += step;
+            chunkDist += step;
+            if (chunkDist < 1.2f)
+                continue;
+
+            Vector3 up = frames[j].Up;
+            Vector3 a = Vector3.ProjectOnPlane(chunkStartFwd, up);
+            Vector3 b = Vector3.ProjectOnPlane(frames[j].Forward, up);
+            if (a.sqrMagnitude > 0.04f && b.sqrMagnitude > 0.04f)
+            {
+                float kappa = Vector3.Angle(a, b) * Mathf.Deg2Rad / chunkDist;
+                float speedSqThere = Mathf.Max(speed * speed + 2f * gEff * (y0 - frames[j].Position.y), minSq);
+                float need = speedSqThere * kappa;
+                if (need > demand)
+                    demand = need;
+            }
+
+            chunkStartFwd = frames[j].Forward;
+            chunkDist = 0f;
+        }
+        return demand;
+    }
+
+    // Замедление (м/с²), нужное прямо сейчас, чтобы подойти к каждому повороту в
+    // тормозном горизонте на скорости, которую держит безрулевое сцепление, а к
+    // трамплину (конец пути) — не быстрее расчётной скорости прыжка. Ограничено
+    // силой тормоза S игрока.
+    float ResolveCornerBrake(IReadOnlyList<WaterSlideMeshBuilder.RideFrame> frames, int startIndex, float speed)
+    {
+        float minSq = _minRideSpeed * _minRideSpeed;
+        float availableAuto = Mathf.Max(_corneringGrip * _autoGripFraction, 1f);
+        float lookahead = Mathf.Min(speed * speed / (2f * Mathf.Max(_brakeAcceleration, 1f)) + 6f, 60f);
+
+        float travelled = 0f;
+        float chunkDist = 0f;
+        float bestDecel = 0f;
+        int i = Mathf.Clamp(startIndex, 0, frames.Count - 1);
+        Vector3 chunkStartFwd = frames[i].Forward;
+        int j = i;
+        while (j + 1 < frames.Count && travelled < lookahead)
+        {
+            float step = Vector3.Distance(frames[j].Position, frames[j + 1].Position);
+            j++;
+            travelled += step;
+            chunkDist += step;
+            if (chunkDist < 1.2f)
+                continue;
+
+            Vector3 up = frames[j].Up;
+            Vector3 a = Vector3.ProjectOnPlane(chunkStartFwd, up);
+            Vector3 b = Vector3.ProjectOnPlane(frames[j].Forward, up);
+            if (a.sqrMagnitude > 0.04f && b.sqrMagnitude > 0.04f)
+            {
+                float kappa = Vector3.Angle(a, b) * Mathf.Deg2Rad / chunkDist;
+                if (kappa > 1e-3f)
+                {
+                    // 0.85 — запас, чтобы подход был заметно ПОД пределом сцепления.
+                    float safeSpeedSq = availableAuto / kappa * 0.85f;
+                    // Ниже минимума автотормоз не гасит: поворот, требующий меньше,
+                    // жёлоб осознанно отпускает — вылеты по инерции остаются в игре.
+                    if (safeSpeedSq < minSq)
+                        safeSpeedSq = minSq;
+                    float distance = Mathf.Max(travelled - chunkDist * 0.5f, 1f);
+                    float decel = (speed * speed - safeSpeedSq) / (2f * distance);
+                    if (decel > bestDecel)
+                        bestDecel = decel;
+                }
+            }
+
+            chunkStartFwd = frames[j].Forward;
+            chunkDist = 0f;
+        }
+
+        // Конец пути в тормозном горизонте — трамплин. Кап скорости выхода считается
+        // ПО ЭНЕРГИИ в точке вылета (подъём/спуск до неё учтён), иначе кап, снятый
+        // здесь, съедался подъёмом и дуга падала с недолётом — фатальнее перелёта.
+        if (_course != null && j + 1 >= frames.Count)
+        {
+            float exitCap = _course.RequiredJumpSpeed * 1.25f;
+            float gEff = Physics.gravity.magnitude * GravityMultiplier;
+            float dropToEnd = transform.position.y - frames[j].Position.y;
+            float allowedSq = exitCap * exitCap - 2f * gEff * dropToEnd;
+            if (allowedSq < Mathf.Max(minSq, 9f))
+                allowedSq = Mathf.Max(minSq, 9f);
+            if (speed * speed > allowedSq)
+            {
+                float decel = (speed * speed - allowedSq) / (2f * Mathf.Max(travelled, 1f));
+                if (decel > bestDecel)
+                    bestDecel = decel;
+            }
+        }
+
+        return Mathf.Min(bestDecel, _brakeAcceleration);
+    }
+
+    // ---- Кадры пути: длины дуги и интерполяция ----
+
+    void BuildLengthCache(WaterSlideGenerator slide)
+    {
+        var frames = slide.RideFrames;
+        _cumLengths = new float[frames.Count];
+        float total = 0f;
+        _cumLengths[0] = 0f;
+        for (int i = 1; i < frames.Count; i++)
+        {
+            total += Vector3.Distance(frames[i - 1].Position, frames[i].Position);
+            _cumLengths[i] = total;
+        }
+        _lengthCacheSlide = slide;
+    }
+
+    void SampleFrame(IReadOnlyList<WaterSlideMeshBuilder.RideFrame> frames, float s,
+        out Vector3 center, out Vector3 tangent, out Vector3 up, out int index)
+    {
+        s = Mathf.Clamp(s, 0f, _cumLengths[^1]);
+
+        // Бинарный поиск сегмента по длине дуги.
+        int lo = 0, hi = _cumLengths.Length - 1;
+        while (hi - lo > 1)
+        {
+            int mid = (lo + hi) >> 1;
+            if (_cumLengths[mid] <= s)
+                lo = mid;
+            else
+                hi = mid;
+        }
+
+        float segLen = Mathf.Max(_cumLengths[hi] - _cumLengths[lo], 1e-4f);
+        float t = (s - _cumLengths[lo]) / segLen;
+
+        center = Vector3.LerpUnclamped(frames[lo].Position, frames[hi].Position, t);
+        Vector3 tanBlend = Vector3.Slerp(frames[lo].Forward, frames[hi].Forward, t);
+        tangent = tanBlend.sqrMagnitude > 1e-6f ? tanBlend.normalized : frames[lo].Forward.normalized;
+        Vector3 upBlend = Vector3.Slerp(frames[lo].Up, frames[hi].Up, t);
+        up = upBlend.sqrMagnitude > 1e-6f ? upBlend.normalized : Vector3.up;
+        index = t < 0.5f ? lo : hi;
+    }
+
+    // ================= ПРИСТЁГИВАНИЕ / ОТРЫВ =================
+
+    // Пристегнуть тело к пути горки. Вызывается при первом внутреннем контакте
+    // капсулы с жёлобом после полёта (или спавн-падения).
+    void AttachToSlide(WaterSlideGenerator slide)
+    {
+        var frames = slide.RideFrames;
+        if (frames == null || frames.Count < 2)
+            return;
+
+        _currentSlide = slide;
+        if (_lengthCacheSlide != slide)
+            BuildLengthCache(slide);
+
+        Vector3 pos = GetBodyCenterWorld();
+        int nearest = FindNearestFrame(frames, pos, 0, frames.Count - 1);
+
+        // Дистанция s: длина до кадра + проекция на сегмент.
+        int segA = Mathf.Clamp(nearest, 0, frames.Count - 2);
+        Vector3 seg = frames[segA + 1].Position - frames[segA].Position;
+        float t = seg.sqrMagnitude > 1e-6f
+            ? Mathf.Clamp01(Vector3.Dot(pos - frames[segA].Position, seg) / seg.sqrMagnitude)
+            : 0f;
+        _ridePathS = _cumLengths[segA] + Vector3.Distance(frames[segA].Position, frames[segA].Position + seg * t);
+        _rideFrameIndex = nearest;
+        _lastGuideIndex = nearest;
+
+        SampleFrame(frames, _ridePathS, out Vector3 center, out Vector3 tangent, out Vector3 up, out _);
+        Vector3 right = Vector3.Cross(up, tangent);
+        right = right.sqrMagnitude > 1e-6f ? right.normalized : Vector3.right;
+
+        Vector3 vel = _rigidbody.linearVelocity;
+        Vector3 offset = pos - center;
+
+        // Короткий подскок с перегиба (профиль ушёл из-под тела и тут же вернулся) —
+        // не приземление: скорость и нормаль переходят без скачков. Потолок посадки
+        // и секунда защиты от вылета — только после настоящего полёта.
+        bool shortHop = _timeSinceSlideContact <= 0.5f;
+
+        // Снап скорости: весь запас хода переходит в езду вдоль пути (потолок —
+        // против переносов огромной скорости падения в езду). На подскоке потолок
+        // не применяется: он резал 25 → 19 м/с одним шагом — камера дёргалась на
+        // перегибах «поворот + спуск» (27.10.2026).
+        float speed = vel.magnitude;
+        if (_landingSnapSpeedCap > 0f && !shortHop)
+            speed = Mathf.Min(speed, Mathf.Max(_landingSnapSpeedCap, MaxRideSpeed));
+        _rideSpeed = speed;
+        _smoothedCurvature = 0f;
+        _cornerDanger = 0f;
+
+        float bodyRadius = GetLateralBodyExtent();
+        float halfWidth = slide.RideHalfWidth;
+        float flatHalf = Mathf.Max(halfWidth - bodyRadius, 0.05f);
+
+        if (slide.Enclosure == SlideEnclosure.Open)
+        {
+            _rideLateral = Mathf.Clamp(Vector3.Dot(offset, right), -flatHalf, flatHalf);
+            _rideLateralVel = Mathf.Clamp(Vector3.Dot(vel, right), -4f, 4f);
+        }
+        else
+        {
+            float lat = Vector3.Dot(offset, right);
+            float h = Vector3.Dot(offset, up);
+            _tubeAngle = Mathf.Atan2(lat, -h);
+            Vector3 tdir = right * Mathf.Cos(_tubeAngle) + up * Mathf.Sin(_tubeAngle);
+            float lift = (_capsule != null ? _capsule.radius : 0.35f) + _surfaceClearance;
+            float rEff = Mathf.Max(halfWidth - lift, 0.1f);
+            _tubeAngularVel = Mathf.Clamp(Vector3.Dot(vel, tdir) / rEff, -6f, 6f);
+        }
+
+        _riding = true;
+        _landingAssistSlide = null;
+        _rideTime = 0f;
+        // Секунда защиты от вылета — только после НАСТОЯЩЕГО полёта. Короткий
+        // подскок с перегиба (профиль ушёл из-под тела и тут же вернулся) защиту
+        // не взводит, иначе трасса со ступенчатым профилем стала бы сплошной рельсой.
+        _landingContainTimer = !shortHop ? _landingContainTime : 0f;
+        _crestHopTimer = 0f;
+        _timeSinceSlideContact = 0f;
+        _guideTangent = tangent;
+        // Нормаль на подскоке не прыгает: её доводит сглаживание в DriveBodyTo
+        // (камера и наклон тела читают _slideNormal).
+        if (!shortHop)
+            _slideNormal = up;
+        _slideNormalTarget = up;
+        _rigidbody.useGravity = false;
+        _hasSlideContactSinceSpawn = true;
+        _controller?.OnSlideContact();
+    }
+
+    // Отрыв от пути: тело получает честную скорость состояния езды и уходит в
+    // свободную баллистику; повторное пристёгивание подавлено на suppress секунд.
+    void DetachFromSlide(Vector3 velocity, float suppress)
+    {
+        _riding = false;
+        _hasRimPlane = false;
+        _guideSuppressTimer = Mathf.Max(_guideSuppressTimer, suppress);
+        _rigidbody.useGravity = true;
+        _rigidbody.linearVelocity = velocity;
+
+        Vector3 flat = Vector3.ProjectOnPlane(velocity, Vector3.up);
+        if (flat.sqrMagnitude > 1e-4f)
+            _flightHeading = flat.normalized;
+    }
+
+    // Намеренный прыжок с горки (пробел): отрыв со скоростью езды + импульс прыжка.
+    public bool TryJumpFromSlide()
+    {
+        if (!_riding)
+            return false;
+
+        Vector3 normal = _slideNormal;
+        Vector3 jumpDir = (normal + Vector3.up * 0.65f).normalized;
+        Vector3 velocity = ComposeRideVelocity() + jumpDir * _slideJumpForce;
+        // Прыжок у самого конца — это прыжок на следующую горку: помощь
+        // приземлению ведёт и его (иначе прыжок давал перелёт).
+        bool nearEnd = _cumLengths != null && _cumLengths.Length > 1
+            && _cumLengths[^1] - _ridePathS <= Mathf.Max(_exitBoostDistance, 0f);
+        _landingAssistSlide = nearEnd ? NextSlide : null;
+        _landingAssistJumped = nearEnd;
+        DetachFromSlide(velocity, _jumpGuideSuppression);
+        return true;
+    }
+
+    // ================= ОРИЕНТАЦИЯ ТЕЛА =================
+
+    void AlignBody()
+    {
+        if (_rigidbody == null || _rigidbody.isKinematic)
+            return;
+
+        // На подскоке с перегиба тело держит позу езды: иначе на банкированном
+        // вираже крен и наклон за 0.1 с уходили к «воздушным» и возвращались рывком.
+        if (_riding || _crestHopTimer > 0f)
+        {
+            // Тело ВСЕГДА вдоль пути: касательная кадра + сглаженная нормаль
+            // поверхности. Никакая скорость/руль повернуть его поперёк не могут.
+            Vector3 normal = _slideNormal;
+            Vector3 forward = Vector3.ProjectOnPlane(_guideTangent, normal);
+            if (forward.sqrMagnitude < 1e-6f)
+            {
+                _rigidbody.angularVelocity = Vector3.zero;
+                return;
+            }
+
+            forward.Normalize();
+            var target = Quaternion.LookRotation(forward, normal);
+            SteerRotationTowards(Quaternion.Slerp(_rigidbody.rotation, target, _slideAlignSpeed * Time.fixedDeltaTime));
+            return;
+        }
+
+        // Стартовое падение после спавна: сохранить ориентацию спавна (нос вдоль
+        // горки), чтобы тело легло плашмя, а не клюнуло в почти вертикальную скорость.
+        if (!_hasSlideContactSinceSpawn)
+        {
+            _rigidbody.angularVelocity = Vector3.zero;
+            return;
+        }
+
+        Vector3 airVelocity = _rigidbody.linearVelocity;
+        if (airVelocity.sqrMagnitude < 0.25f)
+        {
+            _rigidbody.angularVelocity = Vector3.zero;
+            return;
+        }
+
+        // Наклон ограничен асимметрично: вверх (вылет с гребня) — мягко, чтобы не
+        // задирать ноги в небо; вниз (падение) — круто, чтобы тело шло ногами
+        // вперёд вдоль траектории. Полный разворот по скорости (90°) не даём:
+        // у вертикального «вперёд» теряется курс (yaw).
+        float maxPitch = airVelocity.y < 0f ? _maxAirDivePitch : _maxAirPitch;
+        Vector3 airForward = ClampPitch(airVelocity.normalized, Mathf.Min(maxPitch, 85f));
+        float pitch = -Mathf.Asin(Mathf.Clamp(airForward.y, -1f, 1f)) * Mathf.Rad2Deg;
+
+        // Yaw привязан к направлению полёта, замороженному при отрыве, — стрейф
+        // читается как сдвиг вбок, а не поворот. Крен всегда ноль.
+        float yaw = _rigidbody.rotation.eulerAngles.y;
+        if (_flightHeading.sqrMagnitude > 1e-4f)
+        {
+            float headingYaw = Mathf.Atan2(_flightHeading.x, _flightHeading.z) * Mathf.Rad2Deg;
+            yaw = Mathf.MoveTowardsAngle(yaw, headingYaw, 90f * Time.fixedDeltaTime);
+        }
+
+        var airTarget = Quaternion.Euler(pitch, yaw, 0f);
+        SteerRotationTowards(Quaternion.Slerp(_rigidbody.rotation, airTarget, _slideAlignSpeed * 0.5f * Time.fixedDeltaTime));
+    }
+
+    // Поворот тела ведётся ЗАДАНИЕМ угловой скорости, а не MoveRotation: для
+    // динамического интерполируемого Rigidbody MoveRotation — телепорт мимо
+    // интерполяции рендера (модель тикала при быстрой смене цели). Значение
+    // перезаписывается каждый шаг — закрутка от контактов не живёт дольше шага.
+    void SteerRotationTowards(Quaternion desired)
+    {
+        (desired * Quaternion.Inverse(_rigidbody.rotation)).ToAngleAxis(out float angle, out Vector3 axis);
+        if (angle > 180f)
+            angle -= 360f;
+        if (Mathf.Abs(angle) < 1e-3f || float.IsInfinity(axis.x) || axis.sqrMagnitude < 1e-8f)
+        {
+            _rigidbody.angularVelocity = Vector3.zero;
+            return;
+        }
+
+        _rigidbody.angularVelocity = axis.normalized * (angle * Mathf.Deg2Rad / Time.fixedDeltaTime);
+    }
+
+    // Направление с вертикальным углом не больше maxPitchDegrees; горизонтальный
+    // курс сохраняется.
+    Vector3 ClampPitch(Vector3 direction, float maxPitchDegrees)
+    {
+        float sinMax = Mathf.Sin(maxPitchDegrees * Mathf.Deg2Rad);
+        if (Mathf.Abs(direction.y) <= sinMax)
+            return direction;
+
+        Vector3 horizontal = Vector3.ProjectOnPlane(direction, Vector3.up);
+        if (horizontal.sqrMagnitude < 1e-6f)
+            horizontal = Vector3.ProjectOnPlane(transform.forward, Vector3.up);
+        if (horizontal.sqrMagnitude < 1e-6f)
+            return direction;
+
+        float cosMax = Mathf.Cos(maxPitchDegrees * Mathf.Deg2Rad);
+        return (horizontal.normalized * cosMax + Vector3.up * (Mathf.Sign(direction.y) * sinMax)).normalized;
+    }
+
+    // ================= КОНТАКТЫ (только детекция приземления) =================
+
+    void OnCollisionEnter(Collision collision)
+    {
+        if (_collisionRelay != null)
+            return;
+
+        NotifyCollisionEnter(collision);
+    }
+
+    void OnCollisionStay(Collision collision)
+    {
+        if (_collisionRelay != null)
+            return;
+
+        NotifyCollisionStay(collision);
+    }
+
+    void OnCollisionExit(Collision collision)
+    {
+        // Контакты в путевой модели используются только как триггер пристёгивания.
+    }
+
+    public void NotifyCollisionEnter(Collision collision) => HandleSlideTouch(collision);
+
+    public void NotifyCollisionStay(Collision collision) => HandleSlideTouch(collision);
+
+    public void NotifyCollisionExit(Collision collision)
+    {
+    }
+
+    void HandleSlideTouch(Collision collision)
+    {
+        // Пока тело пристёгнуто, контакты не нужны (позу ведёт путь). Полёт с
+        // подавлением (прыжок/вылет) касания игнорирует — вылет должен состояться.
+        if (_riding || _guideSuppressTimer > 0f || _rigidbody == null)
+            return;
+
+        var slide = GetSlideFrom(collision.collider);
+        if (slide == null)
+            return;
+
+        // Касание внешней стороны оболочки — не приземление (пролетаем мимо).
+        if (!IsInnerSurfaceContact(slide, collision))
+            return;
+
+        AttachToSlide(slide);
+    }
+
+    // Тело, прижатое к НАРУЖНОЙ стороне горки, пристёгивать нельзя. Коллайдер —
+    // одиночная внутренняя оболочка, позиции контакта совпадают с обеих сторон —
+    // стороны различает только нормаль контакта: валидная внутренняя смотрит к
+    // центру жёлоба/оси трубы.
+    bool IsInnerSurfaceContact(WaterSlideGenerator slide, Collision collision)
+    {
+        if (collision.contactCount == 0)
+            return true;
+
+        var frames = slide.RideFrames;
+        if (frames == null || frames.Count == 0)
+            return true;
+
+        var contact = collision.GetContact(0);
+        return IsInnerSurfacePoint(slide, contact.point, contact.normal);
+    }
+
+    // Точка поверхности горки с нормалью смотрит к оси жёлоба/трубы — внутренняя
+    // (посадочная) сторона оболочки.
+    static bool IsInnerSurfacePoint(WaterSlideGenerator slide, Vector3 point, Vector3 normal)
+    {
+        var frames = slide.RideFrames;
+        if (frames == null || frames.Count == 0)
+            return true;
+        var frame = frames[FindNearestFrame(frames, point, 0, frames.Count - 1)];
+        return Vector3.Dot(normal, frame.Position - point) > 0f;
     }
 
     float GetLateralBodyExtent()
@@ -1229,8 +1803,9 @@ public class PlayerView : MonoBehaviour
         return _capsule.radius + 0.04f;
     }
 
-    // World position of the capsule centre — the point the containment must reason about.
-    // The rigidbody pivot sits at the rig root (usually the feet), away from the collider.
+    // Мировая позиция центра капсулы — точка, о которой рассуждает вся геометрия
+    // ведения. Пивот rigidbody стоит в корне рига (обычно у ног), в стороне от
+    // коллайдера.
     Vector3 GetBodyCenterWorld()
     {
         if (_rigidbody == null)
@@ -1258,343 +1833,84 @@ public class PlayerView : MonoBehaviour
         return best;
     }
 
-    void AlignBodyToContacts()
-    {
-        // Kinematic during the spawn window — velocity writes would warn.
-        if (_rigidbody == null || _rigidbody.isKinematic)
-            return;
+    // ================= ПУБЛИЧНОЕ УПРАВЛЕНИЕ =================
 
-        // A grace after losing contact: a hop over a seam must not flip the body
-        // into the air alignment — the orientation stays along the slide so the body
-        // settles straight back. 0.6 s, not shorter: with A/D held the surface press
-        // is muted and the wall-side hops regularly last 0.3–0.5 s; falling into the
-        // air branch there yawed the body to the flight heading — the DIAGONAL strafe
-        // velocity — so steering read as the character turning off the tube. A
-        // deliberate jump suppresses guidance and skips the grace, so the flight
-        // pose engages immediately; a real flight flips over once the grace runs out.
-        const float RidingOrientationGrace = 0.6f;
-        bool ridingGrace = _hasSlideContactSinceSpawn
-            && _guideSuppressTimer <= 0f
-            && _timeSinceSlideContact < RidingOrientationGrace;
-        if (IsOnSlide || _hasGuide || ridingGrace)
-        {
-            Vector3 normal = _slideNormal;
-
-            // Prefer the path tangent: it is smooth along the whole slide, while velocity
-            // direction wobbles with every contact and makes the body twitch. The LAST
-            // smoothed tangent also covers the steps where the guide is momentarily gone
-            // (micro contact loss on seams — frequent with A/D held, because the input
-            // mutes the surface press): falling back to the velocity there yawed the
-            // body towards the DIAGONAL strafe motion on every flicker — read as "the
-            // character turns across the slide whenever I steer". The body must always
-            // lie ALONG the slide while riding; the steer forces are lateral-only and
-            // remain untouched by this.
-            bool freshTangent = _hasSmoothedGuideTangent && _timeSinceSlideContact < RidingOrientationGrace;
-            Vector3 forward = _hasGuide || freshTangent
-                ? Vector3.ProjectOnPlane(_smoothedGuideTangent, normal)
-                : Vector3.ProjectOnPlane(_rigidbody.linearVelocity, normal);
-            if (forward.sqrMagnitude < 0.25f)
-                forward = Vector3.ProjectOnPlane(transform.forward, normal);
-            if (forward.sqrMagnitude < 1e-6f)
-            {
-                _rigidbody.angularVelocity = Vector3.zero;
-                return;
-            }
-
-            forward.Normalize();
-            var target = Quaternion.LookRotation(forward, normal);
-
-            // Ramped with the capture ease (floored so the body still settles): a full-
-            // speed re-align on first touch reads as the slide snapping the body around.
-            // During the cross-landing catch the ramp is bypassed — the body must swing
-            // along the slide together with the fast velocity turn, not seconds later.
-            float align = _slideAlignSpeed * (_crossLandingTimer > 0f
-                ? 1f
-                : Mathf.Lerp(0.35f, 1f, AssistWeight));
-            SteerRotationTowards(Quaternion.Slerp(_rigidbody.rotation, target, align * Time.fixedDeltaTime));
-            return;
-        }
-
-        // Initial drop onto the first slide: keep the spawn orientation (nose along the
-        // slide) so the body lands flat instead of pitching into the near-vertical velocity.
-        if (!_hasSlideContactSinceSpawn)
-        {
-            _rigidbody.angularVelocity = Vector3.zero;
-            return;
-        }
-
-        Vector3 airVelocity = _rigidbody.linearVelocity;
-        if (airVelocity.sqrMagnitude < 0.25f)
-        {
-            _rigidbody.angularVelocity = Vector3.zero;
-            return;
-        }
-
-        // The pitch is CLAMPED: following the full 3D velocity pointed the body nose-first
-        // down the fall arc — any strafe or jump read as the player keeling over forward.
-        Vector3 airForward = ClampPitch(airVelocity.normalized, Mathf.Min(_maxAirPitch, 80f));
-        float pitch = -Mathf.Asin(Mathf.Clamp(airForward.y, -1f, 1f)) * Mathf.Rad2Deg;
-
-        // The yaw is anchored to the FLIGHT HEADING frozen at launch, NEVER to the
-        // velocity. Chasing the velocity (even only between strafes) meant every strafe
-        // permanently turned the flight: the bent velocity became the new "forward",
-        // the body and the camera swung after it, and A/D read as a turn instead of a
-        // sideways shift. The heading is constant per flight, so the view stays put.
-        // Roll is pinned to zero by construction.
-        float yaw = _rigidbody.rotation.eulerAngles.y;
-        if (_flightHeading.sqrMagnitude > 1e-4f)
-        {
-            float headingYaw = Mathf.Atan2(_flightHeading.x, _flightHeading.z) * Mathf.Rad2Deg;
-            yaw = Mathf.MoveTowardsAngle(yaw, headingYaw, 90f * Time.fixedDeltaTime);
-        }
-
-        var airTarget = Quaternion.Euler(pitch, yaw, 0f);
-        SteerRotationTowards(Quaternion.Slerp(_rigidbody.rotation, airTarget, _slideAlignSpeed * 0.5f * Time.fixedDeltaTime));
-    }
-
-    // The body rotation is driven by SETTING the angular velocity, never by
-    // MoveRotation: on a dynamic interpolated rigidbody MoveRotation is a teleport —
-    // the rotation stepped 50 times/s past the render interpolation, and the model
-    // visibly twitched whenever the target orientation changed fast (riding a
-    // changing slope, the pitch chasing the fall arc). Velocity-driven rotation is
-    // integrated by the simulation, so the render interpolates it like any physical
-    // motion. The value is overwritten every step, so control stays as absolute as
-    // the teleport was, and spin the contacts add within a step is discarded.
-    void SteerRotationTowards(Quaternion desired)
-    {
-        (desired * Quaternion.Inverse(_rigidbody.rotation)).ToAngleAxis(out float angle, out Vector3 axis);
-        if (angle > 180f)
-            angle -= 360f;
-        if (Mathf.Abs(angle) < 1e-3f || float.IsInfinity(axis.x) || axis.sqrMagnitude < 1e-8f)
-        {
-            _rigidbody.angularVelocity = Vector3.zero;
-            return;
-        }
-
-        _rigidbody.angularVelocity = axis.normalized * (angle * Mathf.Deg2Rad / Time.fixedDeltaTime);
-    }
-
-    // Direction with its vertical angle limited to ±maxPitchDegrees; the horizontal
-    // heading is preserved.
-    Vector3 ClampPitch(Vector3 direction, float maxPitchDegrees)
-    {
-        float sinMax = Mathf.Sin(maxPitchDegrees * Mathf.Deg2Rad);
-        if (Mathf.Abs(direction.y) <= sinMax)
-            return direction;
-
-        Vector3 horizontal = Vector3.ProjectOnPlane(direction, Vector3.up);
-        if (horizontal.sqrMagnitude < 1e-6f)
-            horizontal = Vector3.ProjectOnPlane(transform.forward, Vector3.up);
-        if (horizontal.sqrMagnitude < 1e-6f)
-            return direction;
-
-        float cosMax = Mathf.Cos(maxPitchDegrees * Mathf.Deg2Rad);
-        return (horizontal.normalized * cosMax + Vector3.up * (Mathf.Sign(direction.y) * sinMax)).normalized;
-    }
-
-    void OnCollisionEnter(Collision collision)
-    {
-        if (_collisionRelay != null)
-            return;
-
-        NotifyCollisionEnter(collision);
-    }
-
-    void OnCollisionStay(Collision collision)
-    {
-        if (_collisionRelay != null)
-            return;
-
-        NotifyCollisionStay(collision);
-    }
-
-    void OnCollisionExit(Collision collision)
-    {
-        if (_collisionRelay != null)
-            return;
-
-        NotifyCollisionExit(collision);
-    }
-
-    public void NotifyCollisionEnter(Collision collision)
-    {
-        var slide = GetSlideFrom(collision.collider);
-        if (slide == null)
-            return;
-
-        if (!IsInnerSurfaceContact(slide, collision))
-        {
-            TryCatchRimLanding(slide);
-            return;
-        }
-
-        _slideContacts.Add(collision.collider);
-        _hasSlideContactSinceSpawn = true;
-        TrackCurrentSlide(slide);
-        UpdateSlideNormal(collision);
-        _controller?.OnSlideContact();
-    }
-
-    public void NotifyCollisionStay(Collision collision)
-    {
-        var slide = GetSlideFrom(collision.collider);
-        if (slide == null)
-            return;
-
-        // Re-evaluate the side every step: a touch can migrate between the inner and
-        // the outer face of the wall (e.g. grazing the mouth rim).
-        if (!IsInnerSurfaceContact(slide, collision))
-        {
-            _slideContacts.Remove(collision.collider);
-            TryCatchRimLanding(slide);
-            return;
-        }
-
-        if (_slideContacts.Add(collision.collider))
-        {
-            _hasSlideContactSinceSpawn = true;
-            _controller?.OnSlideContact();
-        }
-
-        TrackCurrentSlide(slide);
-        UpdateSlideNormal(collision);
-    }
-
-    public void NotifyCollisionExit(Collision collision)
-    {
-        if (GetSlideFrom(collision.collider) == null)
-            return;
-
-        _slideContacts.Remove(collision.collider);
-    }
-
-    // LANDING ON THE WALL LIP. A touchdown on the rim of an open flume reports a
-    // contact whose normal points up along the lip, not towards the channel centre —
-    // IsInnerSurfaceContact files it as exterior, so it never counts as a slide
-    // contact: no guidance, no touchdown snap, and the body simply toppled off the
-    // outer side and left the course. After a real flight such a touch IS a landing
-    // the player expects to be caught: the body is moved inside the channel (against
-    // the wall it hit) and the outward lateral speed is stripped; the floor contact a
-    // moment later runs the normal touchdown snap that lays the velocity along the
-    // slide. Deliberate jumps (guidance suppressed) and short seam hops are exempt,
-    // so riding over the wall on built-up inertia still ejects as designed.
-    void TryCatchRimLanding(WaterSlideGenerator slide)
-    {
-        // Normally only a touch after a REAL flight is a rim landing (seam hops must
-        // not trigger the rescue) — but inside the post-landing containment window
-        // every rim touch is caught: the body may not leave the channel at all there,
-        // including via a short hop onto the lip right after touchdown.
-        if (_rigidbody == null
-            || slide.Enclosure != SlideEnclosure.Open
-            || (_timeSinceSlideContact <= 0.3f && _landingContainTimer <= 0f)
-            || _guideSuppressTimer > 0f)
-            return;
-
-        if (!TryGetGuideFrameOnSlide(slide, out Vector3 center, out Vector3 tangent, out Vector3 up, out float halfWidth))
-            return;
-
-        Vector3 right = Vector3.Cross(up, tangent);
-        if (right.sqrMagnitude < 1e-6f)
-            return;
-        right.Normalize();
-
-        Vector3 offset = GetBodyCenterWorld() - center;
-        float lateral = Vector3.Dot(offset, right);
-        float height = Vector3.Dot(offset, up);
-        float bodyRadius = GetLateralBodyExtent();
-        float usableHalf = Mathf.Max(halfWidth - bodyRadius, 0.04f);
-
-        // Only a body over the wall band and around lip height is a rim landing:
-        // inside the channel there is nothing to rescue, far past the wall or low on
-        // the outer face the flight is genuinely outside the course.
-        if (Mathf.Abs(lateral) <= usableHalf
-            || Mathf.Abs(lateral) > halfWidth + bodyRadius * 2f
-            || height < slide.FlumeLipHeight * 0.5f)
-            return;
-
-        float side = Mathf.Sign(lateral);
-        _rigidbody.position += right * (side * usableHalf - lateral);
-
-        Vector3 vel = _rigidbody.linearVelocity;
-        float outward = Vector3.Dot(vel, right) * side;
-        if (outward > 0f)
-            _rigidbody.linearVelocity = vel - right * (side * outward);
-    }
-
-    // A body pressed against the OUTSIDE of a slide must not ride it: counting that
-    // touch as a slide contact turned on the stick and downhill forces, which glued the
-    // player to the exterior and carried him along the course. The collider is a SINGLE
-    // inner-shell mesh, so contact POSITIONS are identical from both sides (a tube-
-    // radius test passed exterior touches!) — only the contact normal tells the sides
-    // apart: it points from the surface towards the body, and a valid inner contact
-    // therefore points towards the slide interior (tube axis / flume channel centre).
-    bool IsInnerSurfaceContact(WaterSlideGenerator slide, Collision collision)
-    {
-        if (collision.contactCount == 0)
-            return true;
-
-        var frames = slide.RideFrames;
-        if (frames == null || frames.Count == 0)
-            return true;
-
-        var contact = collision.GetContact(0);
-        var frame = frames[FindNearestFrame(frames, contact.point, 0, frames.Count - 1)];
-        return Vector3.Dot(contact.normal, frame.Position - contact.point) > 0f;
-    }
-
-    void TrackCurrentSlide(WaterSlideGenerator slide)
-    {
-        if (_currentSlide == slide)
-            return;
-
-        _currentSlide = slide;
-        _lastGuideIndex = -1;
-        _hasSmoothedGuideTangent = false;
-    }
-
-    public void ResetSlideContacts()
-    {
-        _slideContacts.Clear();
-    }
-
-    // Two ride feels, switchable from the component context menu (⋮). "Loose" lets the
-    // body swing wall-to-wall like a real water slide; "Rail" keeps it glued to the path.
-    [ContextMenu("Ride Preset — Loose (болтание)")]
-    public void ApplyLooseRidePreset()
-    {
-        _velocitySteer = 4f;
-        _boundsLimit = 0.88f;
-        _lateralDamping = 0.5f;
-        _centeringAccel = 4f;
-        MarkDirtyInEditor();
-    }
-
-    [ContextMenu("Ride Preset — Rail (по рельсам)")]
-    public void ApplyRailRidePreset()
-    {
-        _velocitySteer = 9f;
-        _boundsLimit = 0.95f;
-        _lateralDamping = 3f;
-        _centeringAccel = 14f;
-        MarkDirtyInEditor();
-    }
-
-    void MarkDirtyInEditor()
-    {
-#if UNITY_EDITOR
-        if (!Application.isPlaying)
-            UnityEditor.EditorUtility.SetDirty(this);
-#endif
-    }
-
-    // A/D while riding: the guide assist releases the lateral axis for that time so the
-    // steer force in PlayerController actually moves the body across the flow.
+    // A/D на горке: поперечное перемещение в путевой модели.
     public void SetSlideSteerInput(float axis)
     {
         _slideSteerInput = axis;
     }
 
-    // W/S state, exposed for feedback effects (the speed-rush blur keys off it).
+    // Руль-ползунок: целевое поперечное положение, −1..1 (доля ширины пола;
+    // в трубе — доля угла ±60°). active=false — цели нет, рулит SetSlideSteerInput.
+    // Гейн скоростного контура руля: ускорение = (желаемая − текущая поперечная
+    // скорость) × это. Для контура «скорость = гейн × ошибка» затухание
+    // ζ = √(c/k)/2, отсюда c = 4ζ²k (ζ = 1 → 4k, критическое).
+    float SteerVelocityGain => 4f * _steerDampingRatio * _steerDampingRatio * _lateralTargetGain;
+
+    // Ускорение руля с пределом силы. Ограничивать ещё и скорость его изменения
+    // (рывок) НЕЛЬЗЯ: при пределе 300 м/с³ запаздывание раскачивало регулятор —
+    // поперечная скорость меняла знак ~2 раза в секунду (замер 06.11.2026).
+    // Плавность даёт сглаживание цели пальца в InputController.
+    float ClampSteerAccel(float raw)
+    {
+        return Mathf.Clamp(raw, -_slideSteerForce, _slideSteerForce);
+    }
+
+    public void SetSlideLateralTarget(float normalized, bool active)
+    {
+        _slideLateralTarget = Mathf.Clamp(normalized, -1f, 1f);
+        _hasLateralTarget = active;
+    }
+
+    // Прогноз точки приземления в полёте: баллистика от центра тела с текущей
+    // скоростью, шагами 0.05 с до horizon секунд; первая ВНУТРЕННЯЯ поверхность
+    // горки на пути — точка. Для прицела приземления (LandingReticle).
+    public bool TryPredictLanding(float horizon, out Vector3 point, out Vector3 normal, out WaterSlideGenerator slide)
+    {
+        point = default;
+        normal = Vector3.up;
+        slide = null;
+        if (_rigidbody == null)
+            return false;
+
+        Vector3 pos = GetBodyCenterWorld();
+        Vector3 vel = _rigidbody.linearVelocity;
+        Vector3 g = Physics.gravity * GravityMultiplier;
+        const float step = 0.05f;
+        float radius = _capsule != null ? _capsule.radius : 0.35f;
+        for (float t = 0f; t < horizon; t += step)
+        {
+            Vector3 next = pos + vel * step + g * (0.5f * step * step);
+            Vector3 seg = next - pos;
+            float len = seg.magnitude;
+            if (len > 1e-4f)
+            {
+                int count = Physics.RaycastNonAlloc(pos, seg / len, _sweepHits, len + radius, ~0, QueryTriggerInteraction.Ignore);
+                float best = float.MaxValue;
+                for (int i = 0; i < count; i++)
+                {
+                    var hit = _sweepHits[i];
+                    if (hit.collider == null || hit.distance >= best)
+                        continue;
+                    var s = GetSlideFrom(hit.collider);
+                    if (s == null || !IsInnerSurfacePoint(s, hit.point, hit.normal))
+                        continue;
+                    best = hit.distance;
+                    point = hit.point;
+                    normal = hit.normal;
+                    slide = s;
+                }
+                if (slide != null)
+                    return true;
+            }
+            pos = next;
+            vel += g * step;
+        }
+        return false;
+    }
+
+    // W/S — читается эффектами (блюр разгона) и путевой моделью.
     public float ThrottleInput { get; private set; }
 
     public void SetThrottleInput(float axis)
@@ -1602,30 +1918,125 @@ public class PlayerView : MonoBehaviour
         ThrottleInput = axis;
     }
 
-    // Intentional jumps must win against the rail assist for a moment.
-    public void SuppressGuidance()
+    // Пауза пристёгивания — используется воздушным прыжком.
+    // Трамплинный разгон (см. _exitBoostDistance): по энергии оценивается скорость
+    // в точке вылета (спуск/подъём до конца учтён), и если она ниже расчётной
+    // скорости прыжка, добирается ровно столько ускорения, чтобы к концу горки её
+    // достичь. Тормоз пальцем в этой зоне перекрывается — вылет всегда достаёт до
+    // входа следующей горки (боковой промах по-прежнему исправляет стрейф).
+    void ApplyExitBoost(IReadOnlyList<WaterSlideMeshBuilder.RideFrame> frames, Vector3 gravity, float dt)
     {
-        _guideSuppressTimer = _jumpGuideSuppression;
-        _hasGuide = false;
-        _hasSmoothedGuideTangent = false;
+        if (_course == null || _exitBoostDistance <= 0f || _cumLengths == null || _cumLengths.Length < 2)
+            return;
+        var slides = _course.Slides;
+        if (!_course.Endless && slides.Count > 0 && slides[slides.Count - 1] == _currentSlide)
+            return;
+        float remaining = _cumLengths[^1] - _ridePathS;
+        if (remaining <= 0.05f || remaining > _exitBoostDistance)
+            return;
+        float target = _course.RequiredJumpSpeed;
+        int here = Mathf.Clamp(_rideFrameIndex, 0, frames.Count - 1);
+        float dropToEnd = frames[here].Position.y - frames[frames.Count - 1].Position.y;
+        float endSq = _rideSpeed * _rideSpeed + 2f * gravity.magnitude * dropToEnd;
+        if (endSq >= target * target)
+            return;
+        float need = (target * target - Mathf.Max(endSq, 0f)) / (2f * Mathf.Max(remaining, 0.5f));
+        _rideSpeed += Mathf.Min(need, _exitBoostMaxAccel) * dt;
     }
 
-    // Lets the spawner pre-assign the slide so guidance works during the initial drop,
-    // before the first collision has been registered.
+    // Прыжок в воздухе (PlayerController): на перелёте с конца горки он и есть
+    // «прыжок на следующую горку» — включает полную помощь приземлению.
+    public void NotifyAirJump()
+    {
+        if (_landingAssistSlide != null)
+            _landingAssistJumped = true;
+    }
+
+    // Был ли уже прыжок на текущем перелёте к следующей горке (для подсказок).
+    public bool NeedsJumpToReachNext => !_riding && _landingAssistSlide != null && !_landingAssistJumped;
+
+    // Помощь приземлению (см. _landingAssistAccel). Цель — точка на осевой
+    // следующей горки в _landingAssistTargetS метрах от её начала, поднятая на
+    // радиус тела. По текущей вертикальной скорости и высоте над целью — время
+    // падения до её уровня; нужная горизонтальная скорость = расстояние / время.
+    // Подгоняется только составляющая вдоль направления на цель, с пределом
+    // ускорения и за половину оставшегося времени (без рывка). Перпендикулярная
+    // составляющая — за игроком.
+    void ApplyLandingAssist()
+    {
+        var target = _landingAssistSlide;
+        if (target == null || _landingAssistAccel <= 0f || _rigidbody == null || _rigidbody.isKinematic)
+            return;
+        var frames = target.RideFrames;
+        if (frames == null || frames.Count < 2)
+            return;
+
+        float s = 0f;
+        int k = 0;
+        while (k < frames.Count - 1 && s < _landingAssistTargetS)
+        {
+            s += Vector3.Distance(frames[k].Position, frames[k + 1].Position);
+            k++;
+        }
+        if (!_landingAssistJumped)
+        {
+            if (_noJumpShortfall <= 0f)
+                return;
+            k = 0; // без прыжка — относительно самого начала горки (рампы)
+        }
+        float lift = _capsule != null ? _capsule.radius : 0.35f;
+        Vector3 aim = frames[k].Position + frames[k].Up * lift;
+        Vector3 pos = GetBodyCenterWorld();
+        Vector3 vel = _rigidbody.linearVelocity;
+        float g = Physics.gravity.magnitude * GravityMultiplier;
+        float h = pos.y - aim.y;
+        float disc = vel.y * vel.y + 2f * g * h;
+        if (disc <= 0f)
+        {
+            // Цель выше вершины дуги — достать нельзя; не дёргаем, отключаемся.
+            _landingAssistSlide = null;
+            return;
+        }
+        float tFall = (vel.y + Mathf.Sqrt(disc)) / g;
+        if (tFall < 0.12f)
+            return;
+        Vector3 toAim = Vector3.ProjectOnPlane(aim - pos, Vector3.up);
+        float dist = toAim.magnitude;
+        if (dist < 0.05f)
+            return;
+        Vector3 dir = toAim / dist;
+        float along = Vector3.Dot(Vector3.ProjectOnPlane(vel, Vector3.up), dir);
+        float desired = dist / tFall;
+        // Без прыжка — недолёт: цель ближе нужного, и только торможение (если дуга
+        // и так короче — не трогаем).
+        if (!_landingAssistJumped)
+            desired = Mathf.Max(dist - _noJumpShortfall, 0f) / tFall;
+        // Без прыжка тормозим втрое сильнее и быстрее: на вылете 25–30 м/с предела
+        // помощи (25 м/с²) не хватало, чтобы уложить дугу перед рампой (замер 10.11.2026).
+        float limit = _landingAssistJumped ? _landingAssistAccel : _landingAssistAccel * 3f;
+        float settle = _landingAssistJumped ? Mathf.Max(tFall * 0.5f, 0.2f) : Mathf.Max(tFall * 0.25f, 0.1f);
+        float acc = Mathf.Clamp((desired - along) / settle, -limit, limit);
+        if (!_landingAssistJumped && acc > 0f)
+            return;
+        AddAirControlAcceleration(dir * acc);
+    }
+
+    public void SuppressGuidance()
+    {
+        _guideSuppressTimer = Mathf.Max(_guideSuppressTimer, _jumpGuideSuppression);
+    }
+
+    // Спавнер задаёт трассу заранее, чтобы ведение знало курс до первого касания.
     public void SetCourse(WaterSlideCourse course)
     {
         _course = course;
 
-        // The speed cap adapts to the course: a jump tuned longer in the Inspector
-        // (JumpGap and friends) automatically raises the reachable top speed, so every
-        // generated jump stays physically makeable. Never lowers the configured cap.
+        // Потолок скорости подстраивается под трассу: прыжок, настроенный длиннее,
+        // автоматически поднимает достижимую скорость. Никогда не опускает.
         if (course != null)
         {
-            // No gravity scaling here: the course places jump landings ballistically for
-            // AssumedExitSpeed under THIS player's actual gravity (multiplier included),
-            // so RequiredJumpSpeed is already in real-flight terms.
             float required = course.RequiredJumpSpeed;
-            if (required > _maxSlideSpeed)
+            if (HasSpeedCap && required > _maxSlideSpeed)
             {
                 Debug.Log($"PlayerView: max slide speed raised {_maxSlideSpeed:F1} → {required:F1} m/s to match the course jump settings.");
                 _maxSlideSpeed = required;
@@ -1633,10 +2044,45 @@ public class PlayerView : MonoBehaviour
         }
     }
 
+    // Временное игнорирование коллайдера горки капсулой (вылет за борт).
+    Collider _ignoredSlideCollider;
+    float _ignoreSlideTimer;
+
+    void IgnoreSlideCollision(WaterSlideGenerator slide, float seconds)
+    {
+        if (slide == null || _capsule == null)
+            return;
+        var col = slide.GetComponent<MeshCollider>();
+        if (col == null)
+            return;
+
+        RestoreIgnoredSlideCollision();
+        Physics.IgnoreCollision(_capsule, col, true);
+        _ignoredSlideCollider = col;
+        _ignoreSlideTimer = seconds;
+    }
+
+    void RestoreIgnoredSlideCollision()
+    {
+        if (_ignoredSlideCollider != null && _capsule != null)
+            Physics.IgnoreCollision(_capsule, _ignoredSlideCollider, false);
+        _ignoredSlideCollider = null;
+        _ignoreSlideTimer = 0f;
+    }
+
+    void TickIgnoredSlideCollision()
+    {
+        if (_ignoredSlideCollider == null)
+            return;
+        _ignoreSlideTimer -= Time.fixedDeltaTime;
+        if (_ignoreSlideTimer <= 0f)
+            RestoreIgnoredSlideCollision();
+    }
+
     public void SetGuideSlide(WaterSlideGenerator slide)
     {
         if (slide != null)
-            TrackCurrentSlide(slide);
+            _currentSlide = slide;
     }
 
     public void Teleport(Vector3 worldPosition, Vector3 worldForward)
@@ -1650,9 +2096,10 @@ public class PlayerView : MonoBehaviour
         {
             _rigidbody.position = worldPosition;
             _rigidbody.rotation = rotation;
+            _rigidbody.useGravity = true;
 
-            // The spawn teleport happens while the body is still kinematic (BeginPlay
-            // un-freezes it later) — kinematic bodies reject velocity writes with a warning.
+            // Спавн-телепорт происходит, пока тело кинематическое (BeginPlay
+            // разморозит позже) — кинематика отклоняет запись скорости.
             if (!_rigidbody.isKinematic)
             {
                 _rigidbody.linearVelocity = Vector3.zero;
@@ -1661,28 +2108,32 @@ public class PlayerView : MonoBehaviour
         }
 
         Physics.SyncTransforms();
-        _slideContacts.Clear();
+        _riding = false;
         _hasSlideContactSinceSpawn = false;
         _flightHeading = Vector3.ProjectOnPlane(forward, Vector3.up).sqrMagnitude > 1e-4f
             ? Vector3.ProjectOnPlane(forward, Vector3.up).normalized
             : Vector3.forward;
         _slideNormal = Vector3.up;
         _slideNormalTarget = Vector3.up;
+        _guideTangent = forward;
         _lastGuideIndex = -1;
-        _hasGuide = false;
-        _guideWasActive = false;
-        _hasSmoothedGuideTangent = false;
+        _rideFrameIndex = 0;
+        _ridePathS = 0f;
+        _rideLateral = 0f;
+        _rideLateralVel = 0f;
+        _landingAssistSlide = null;
+        _rideSpeed = 0f;
+        _tubeAngle = 0f;
+        _tubeAngularVel = 0f;
+        _smoothedCurvature = 0f;
+        _cornerDanger = 0f;
+        _guideSuppressTimer = 0f;
         _timeSinceSlideContact = 999f;
-        _assistRamp = 0f;
-        _crossLandingCheckPending = false;
-        _crossLandingTimer = 0f;
-        _landingNoBounceTimer = 0f;
         _landingContainTimer = 0f;
-        _overGripTimer = 0f;
-        _prevGuideTangentTime = float.NegativeInfinity;
-        _lastWallLaunchTime = float.NegativeInfinity;
+        _crestHopTimer = 0f;
         _hasRimPlane = false;
         _fitInitialized = false;
+        _hasLastSweepCenter = false;
         UpdateColliderPose();
     }
 
@@ -1696,37 +2147,24 @@ public class PlayerView : MonoBehaviour
         _rigidbody.linearDamping = 0f;
         _rigidbody.angularDamping = 0.05f;
         _rigidbody.interpolation = RigidbodyInterpolation.Interpolate;
-        // Sweep CCD, NOT speculative: speculative contacts are created a full per-step
-        // travel distance (~0.4 m at speed) ahead of the surface — the body rode an
-        // invisible cushion above the slide and lost real contact entirely.
+        // Sweep CCD, НЕ спекулятивный: спекулятивные контакты создаются на дистанции
+        // шага перед поверхностью — тело ехало на невидимой подушке.
         _rigidbody.collisionDetectionMode = CollisionDetectionMode.Continuous;
-        // Rotation is NOT frozen: the body alignment drives it by setting the angular
-        // velocity every step (see SteerRotationTowards) — sim-driven rotation renders
-        // interpolated, while the former FreezeRotation + per-step MoveRotation combo
-        // teleported the rotation 50 times/s past the interpolation and the model
-        // twitched whenever the target orientation changed fast. Control stays
-        // absolute: the angular velocity is overwritten every step, so contact-induced
-        // spin never survives longer than one step.
+        // Вращение не заморожено: ориентацию ведёт задание угловой скорости
+        // (SteerRotationTowards) — рендер интерполирует её как физическое движение.
         _rigidbody.constraints = RigidbodyConstraints.None;
-        // Default cap is 7 rad/s — the cross-landing body turn legitimately needs ~30.
         _rigidbody.maxAngularVelocity = 50f;
         _rigidbody.useGravity = true;
 
-        // Soften ring-seam hits: the slide collider is a faceted polyline, and in turns
-        // the capsule meets each next facet at a small head-on angle. A capped
-        // depenetration velocity turns the pop-out kick into a gentle push. 1.0, down
-        // from 2.5: riding pressed against a wall, every facet delivered its pop-out
-        // as a sideways kick off the wall — at 2.5 м/с per step it read as endlessly
-        // bouncing off the walls. Overlaps now resolve over a few frames instead of
-        // one; the contact offset and CCD keep them small to begin with.
+        // Смягчение ударов о швы колец: пинок выталкивания из фасетки не больше
+        // 1 м/с за шаг (при езде это отклонение ~5°, незаметно).
         _rigidbody.maxDepenetrationVelocity = 1f;
 
         if (_capsule == null)
             return;
 
-        // A larger contact offset makes PhysX pick up the next facet EARLY and resolve
-        // the transition over several solver steps instead of one impulse — the standard
-        // remedy for capsules snagging on interior edges of a mesh collider.
+        // Больший contact offset заставляет PhysX подхватывать следующую фасетку
+        // заранее и решать переход за несколько шагов, а не одним импульсом.
         _capsule.contactOffset = 0.06f;
 
         if (_physicsMaterial == null)
@@ -1822,28 +2260,10 @@ public class PlayerView : MonoBehaviour
 
     static WaterSlideGenerator GetSlideFrom(Collider other) =>
         other.GetComponentInParent<WaterSlideGenerator>();
-
-    void UpdateSlideNormal(Collision collision)
-    {
-        if (collision.contactCount == 0)
-            return;
-
-        Vector3 avg = Vector3.zero;
-        for (int i = 0; i < collision.contactCount; i++)
-            avg += collision.GetContact(i).normal;
-
-        if (avg.sqrMagnitude < 1e-6f)
-            return;
-
-        // Only the target here — the actual normal is slerped towards it in FixedUpdate,
-        // otherwise per-triangle normal changes shake the body.
-        _slideNormalTarget = avg.normalized;
-    }
 }
 
 public struct PlayerMovementSettings
 {
-    public float SlideTurnSpeed;
     public float SlideSteerForce;
     public float MaxSlideSteerSpeed;
     public float SlideJumpForce;
