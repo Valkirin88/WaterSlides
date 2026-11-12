@@ -1,0 +1,571 @@
+using UnityEngine;
+using UnityEngine.UI;
+using UnityEngine.EventSystems;
+using UnityEngine.InputSystem.UI;
+
+// Счёт на экране. Очки капают за пройденные метры на горке; быстрая езда (выше
+// доли потолка) и ускоряющие полосы умножают — скорость становится наградой, а
+// тормоз — ценой за надёжность. Рекорд хранится в PlayerPrefs. Объекты и ссылки
+// создаёт меню Water Slides/Setup Controls. Подсказка по управлению была —
+// убрана 28.10.2026 по просьбе пользователя (меню Remove Controls Hint).
+public class RideHud : MonoBehaviour
+{
+    [Tooltip("Игрок. Пусто — находится в сцене сам.")]
+    [SerializeField] PlayerView _player;
+    [Tooltip("Текст счёта.")]
+    [SerializeField] Text _scoreText;
+    [Tooltip("Текст рекорда.")]
+    [SerializeField] Text _bestText;
+    [Tooltip("Текст скорости и множителя.")]
+    [SerializeField] Text _speedText;
+    Text _scoreCaption;
+    Image _scorePanel;
+    Image _speedPanel;
+    Image _speedGaugeFill;
+    Button _pauseButton;
+    GameObject _pauseOverlay;
+    bool _paused;
+    [Tooltip("Очков за метр пути по горке на базовой скорости.")]
+    [SerializeField] float _pointsPerMeter = 1f;
+    [Tooltip("Доля потолка скорости, выше которой включается множитель «быстро». Если потолок скорости у игрока выключен (Max Slide Speed 0), вместо неё действует Fast Speed No Cap.")]
+    [SerializeField, Range(0.5f, 1f)] float _fastFraction = 0.85f;
+    [Tooltip("Скорость, м/с, выше которой включается множитель «быстро», когда потолок скорости у игрока выключен (Max Slide Speed 0).")]
+    [SerializeField] float _fastSpeedNoCap = 19f;
+    [Tooltip("Множитель очков на быстрой езде.")]
+    [SerializeField] float _fastMultiplier = 2f;
+    [Tooltip("Множитель очков на ускоряющей полосе (и секунду после неё).")]
+    [SerializeField] float _boostMultiplier = 3f;
+    [Tooltip("Подкраска скорости по опасности ближайшего поворота (PlayerView.CornerDanger: 1 — на текущей скорости поворот не удержать даже пальцем до упора внутрь). С этой доли опасности цифра скорости становится предупреждающего цвета, с 1 — красной. 0 — предупреждающую зону выключить (только красная).")]
+    [SerializeField, Range(0f, 1f)] float _cornerWarnFraction = 0.8f;
+    [Tooltip("Цвет скорости, когда до предела поворота уже близко (между долей предупреждения и 1).")]
+    [SerializeField] Color _cornerWarnColor = new(1f, 0.7f, 0.2f);
+    [Tooltip("Цвет скорости, когда она слишком высока для ближайшего поворота: без тормоза вынесет за борт.")]
+    [SerializeField] Color _cornerDangerColor = new(1f, 0.25f, 0.2f);
+
+    const string BestKey = "WaterSlides.BestScore";
+
+    float _score;
+    float _best;
+    bool _subscribed;
+    int _shownScore = -1, _shownBest = -1, _shownSpeed = -1, _shownDangerStage = -1;
+    float _shownMultiplier = -1f;
+
+    public float Score => _score;
+
+    void Awake()
+    {
+        _best = PlayerPrefs.GetFloat(BestKey, 0f);
+
+        BuildHudPresentation();
+
+        // Страховка: текст без шрифта не рисуется вовсе.
+        Font fallback = null;
+        foreach (var text in new[] { _scoreText, _bestText, _speedText })
+        {
+            if (text == null || text.font != null)
+                continue;
+            fallback ??= Resources.GetBuiltinResource<Font>("LegacyRuntime.ttf");
+            text.font = fallback;
+        }
+    }
+
+    // Собирает оформление поверх уже существующих текстовых полей из сцены.
+    // Так HUD остаётся совместимым с повторным запуском Setup Controls и
+    // автоматически подстраивается под экран через CanvasScaler.
+    void BuildHudPresentation()
+    {
+        var canvas = GetComponent<Canvas>();
+        if (canvas == null)
+            return;
+        if (GetComponent<GraphicRaycaster>() == null)
+            gameObject.AddComponent<GraphicRaycaster>();
+        if (FindFirstObjectByType<EventSystem>() == null)
+            new GameObject("EventSystem", typeof(EventSystem), typeof(InputSystemUIInputModule));
+
+        var root = transform;
+        if (_scoreText != null)
+        {
+            _scorePanel = EnsurePanel(root, "Score Pill", new Vector2(0f, 1f), new Vector2(24f, -24f), new Vector2(350f, 110f), Color.white);
+            _scoreCaption = EnsureCaption(root, "HUD Star", "★", new Vector2(0f, 1f), new Vector2(40f, -38f), new Vector2(80f, 80f), 72,
+                new Color(1f, 0.76f, 0.12f), TextAnchor.MiddleCenter);
+            _scoreCaption.gameObject.SetActive(false);
+            var star = EnsureImage(root, "HUD Star Icon", HudStarSprite);
+            PlaceImage(star, new Vector2(0f, 1f), new Vector2(42f, -38f), new Vector2(76f, 76f), Color.white);
+            PlaceText(_scoreText, new Vector2(0f, 1f), new Vector2(130f, -26f), new Vector2(216f, 72f), TextAnchor.MiddleLeft, 64, Color.white);
+            if (_bestText != null)
+                PlaceText(_bestText, new Vector2(0f, 1f), new Vector2(132f, -102f), new Vector2(210f, 26f), TextAnchor.MiddleLeft, 22, new Color(0.88f, 0.96f, 1f, 0.96f));
+        }
+
+        if (_speedText != null)
+        {
+            const float speedAnchorX = 0.59f;
+            _speedPanel = EnsurePanel(root, "Speed Pill", new Vector2(speedAnchorX, 1f), new Vector2(0f, -24f), new Vector2(400f, 110f), Color.white);
+            EnsureSpeedometer(root);
+            PlaceText(_speedText, new Vector2(speedAnchorX, 1f), new Vector2(22f, -26f), new Vector2(270f, 68f), TextAnchor.MiddleCenter, 54, Color.white);
+            var gaugeBack = EnsureImage(root, "HUD Speed Gauge Back", HudWhitePillSprite);
+            PlaceImage(gaugeBack, new Vector2(speedAnchorX, 1f), new Vector2(22f, -104f), new Vector2(260f, 14f), new Color(0.015f, 0.14f, 0.25f, 0.78f));
+            _speedGaugeFill = EnsureImage(root, "HUD Speed Gauge Fill", HudWhitePillSprite);
+            PlaceImage(_speedGaugeFill, new Vector2(speedAnchorX, 1f), new Vector2(22f, -104f), new Vector2(260f, 14f), Color.yellow);
+            _speedGaugeFill.type = Image.Type.Filled;
+            _speedGaugeFill.fillMethod = Image.FillMethod.Horizontal;
+            _speedGaugeFill.fillOrigin = (int)Image.OriginHorizontal.Left;
+        }
+
+        _pauseButton = EnsureButton(root, "HUD Pause Button", HudCircleSprite, new Vector2(1f, 1f), new Vector2(-24f, -24f), new Vector2(88f, 88f),
+            Color.white, PauseGame);
+        var oldPauseGlyph = _pauseButton.transform.Find("Pause Glyph");
+        if (oldPauseGlyph != null) oldPauseGlyph.gameObject.SetActive(false);
+        for (int i = 0; i < 2; i++)
+        {
+            var bar = EnsureImage(_pauseButton.transform, "Pause Bar " + i, HudWhitePillSprite);
+            PlaceImage(bar, new Vector2(0.5f, 0.5f), new Vector2(i == 0 ? -10f : 10f, 0f), new Vector2(9f, 34f), Color.white);
+        }
+        BuildPauseOverlay(root);
+
+        if (_scorePanel != null) _scorePanel.transform.SetAsFirstSibling();
+        if (_speedPanel != null) _speedPanel.transform.SetAsFirstSibling();
+        if (_pauseButton != null) _pauseButton.transform.SetAsLastSibling();
+        if (_pauseOverlay != null) _pauseOverlay.transform.SetAsLastSibling();
+    }
+
+    Image EnsurePanel(Transform parent, string objectName, Vector2 anchor, Vector2 position, Vector2 size, Color tint)
+    {
+        var child = parent.Find(objectName);
+        GameObject go;
+        if (child != null) go = child.gameObject;
+        else
+        {
+            go = new GameObject(objectName, typeof(RectTransform), typeof(CanvasRenderer), typeof(Image));
+            go.transform.SetParent(parent, false);
+        }
+        var image = go.GetComponent<Image>();
+        image.sprite = HudPillSprite;
+        image.type = Image.Type.Sliced;
+        image.pixelsPerUnitMultiplier = 0.56f;
+        image.color = tint;
+        image.raycastTarget = false;
+        var outline = go.GetComponent<Outline>();
+        if (outline == null) outline = go.AddComponent<Outline>();
+        outline.effectColor = new Color(0.62f, 0.9f, 1f, 0.8f);
+        outline.effectDistance = new Vector2(2f, -2f);
+        outline.useGraphicAlpha = true;
+        PlaceImage(image, anchor, position, size, tint);
+        return image;
+    }
+
+    Image EnsureImage(Transform parent, string objectName, Sprite sprite)
+    {
+        var child = parent.Find(objectName);
+        GameObject go;
+        if (child != null) go = child.gameObject;
+        else
+        {
+            go = new GameObject(objectName, typeof(RectTransform), typeof(CanvasRenderer), typeof(Image));
+            go.transform.SetParent(parent, false);
+        }
+        var image = go.GetComponent<Image>();
+        image.sprite = sprite;
+        image.raycastTarget = false;
+        return image;
+    }
+
+    static void PlaceImage(Image image, Vector2 anchor, Vector2 position, Vector2 size, Color color)
+    {
+        var rect = image.rectTransform;
+        rect.anchorMin = rect.anchorMax = anchor;
+        rect.pivot = anchor;
+        rect.anchoredPosition = position;
+        rect.sizeDelta = size;
+        image.color = color;
+    }
+
+    Text EnsureCaption(Transform parent, string objectName, string caption, Vector2 anchor, Vector2 position, Vector2 size, int fontSize, Color color, TextAnchor alignment)
+    {
+        var child = parent.Find(objectName);
+        GameObject go;
+        if (child != null) go = child.gameObject;
+        else
+        {
+            go = new GameObject(objectName, typeof(RectTransform), typeof(CanvasRenderer), typeof(Text));
+            go.transform.SetParent(parent, false);
+        }
+        var rect = go.GetComponent<RectTransform>();
+        rect.anchorMin = rect.anchorMax = anchor;
+        rect.pivot = anchor;
+        rect.anchoredPosition = position;
+        rect.sizeDelta = size;
+        var text = go.GetComponent<Text>();
+        text.font = Resources.GetBuiltinResource<Font>("LegacyRuntime.ttf");
+        text.text = caption;
+        text.verticalOverflow = VerticalWrapMode.Overflow;
+        text.horizontalOverflow = HorizontalWrapMode.Overflow;
+        text.fontSize = fontSize;
+        text.fontStyle = FontStyle.Bold;
+        text.color = color;
+        text.alignment = alignment;
+        text.raycastTarget = false;
+        return text;
+    }
+
+    Button EnsureButton(Transform parent, string objectName, Sprite sprite, Vector2 anchor, Vector2 position, Vector2 size, Color color, UnityEngine.Events.UnityAction action)
+    {
+        var child = parent.Find(objectName);
+        GameObject go;
+        if (child != null) go = child.gameObject;
+        else
+        {
+            go = new GameObject(objectName, typeof(RectTransform), typeof(CanvasRenderer), typeof(Image), typeof(Button));
+            go.transform.SetParent(parent, false);
+        }
+        var image = go.GetComponent<Image>();
+        image.sprite = sprite;
+        image.color = color;
+        image.raycastTarget = true;
+        PlaceImage(image, anchor, position, size, color);
+        var button = go.GetComponent<Button>();
+        button.targetGraphic = image;
+        button.onClick.RemoveListener(action);
+        button.onClick.AddListener(action);
+        return button;
+    }
+
+    void BuildPauseOverlay(Transform root)
+    {
+        var child = root.Find("HUD Pause Overlay");
+        if (child == null)
+        {
+            var go = new GameObject("HUD Pause Overlay", typeof(RectTransform), typeof(CanvasRenderer), typeof(Image));
+            go.transform.SetParent(root, false);
+            child = go.transform;
+        }
+        _pauseOverlay = child.gameObject;
+        var backdrop = _pauseOverlay.GetComponent<Image>();
+        backdrop.color = new Color(0.01f, 0.04f, 0.09f, 0.72f);
+        backdrop.raycastTarget = true;
+        var full = (RectTransform)child;
+        full.anchorMin = Vector2.zero;
+        full.anchorMax = Vector2.one;
+        full.offsetMin = full.offsetMax = Vector2.zero;
+
+        var card = EnsurePanel(child, "Pause Card", new Vector2(0.5f, 0.5f), Vector2.zero, new Vector2(520f, 360f), Color.white);
+        var title = EnsureCaption(child, "Pause Title", "ПАУЗА", new Vector2(0.5f, 0.5f), new Vector2(0f, 82f), new Vector2(440f, 80f), 56,
+            Color.white, TextAnchor.MiddleCenter);
+        var resume = EnsureButton(child, "Resume Button", HudPillSprite, new Vector2(0.5f, 0.5f), new Vector2(0f, -82f), new Vector2(300f, 76f),
+            Color.white, ResumeGame);
+        EnsureCaption(resume.transform, "Resume Label", "ПРОДОЛЖИТЬ", new Vector2(0.5f, 0.5f), Vector2.zero, new Vector2(270f, 64f), 28,
+            new Color(0.04f, 0.25f, 0.42f), TextAnchor.MiddleCenter);
+        card.transform.SetAsFirstSibling();
+        title.transform.SetAsLastSibling();
+        resume.transform.SetAsLastSibling();
+        _pauseOverlay.SetActive(false);
+    }
+
+    void EnsureSpeedometer(Transform root)
+    {
+        var arc = EnsureImage(root, "HUD Speedometer Arc", HudSpeedometerSprite);
+        PlaceImage(arc, new Vector2(0.59f, 1f), new Vector2(-152f, -38f), new Vector2(64f, 64f), Color.white);
+        var oldNeedle = root.Find("HUD Speedometer Needle");
+        if (oldNeedle != null) oldNeedle.gameObject.SetActive(false);
+    }
+
+    void PauseGame()
+    {
+        if (_pauseOverlay == null) return;
+        _paused = true;
+        Time.timeScale = 0f;
+        _pauseOverlay.SetActive(true);
+    }
+
+    void ResumeGame()
+    {
+        _paused = false;
+        Time.timeScale = 1f;
+        if (_pauseOverlay != null) _pauseOverlay.SetActive(false);
+    }
+
+    static void PlaceText(Text text, Vector2 anchor, Vector2 position, Vector2 size, TextAnchor alignment, int fontSize, Color color)
+    {
+        var rect = text.rectTransform;
+        rect.anchorMin = rect.anchorMax = anchor;
+        rect.pivot = anchor;
+        rect.anchoredPosition = position;
+        rect.sizeDelta = size;
+        text.alignment = alignment;
+        text.fontSize = fontSize;
+        text.fontStyle = FontStyle.Bold;
+        text.color = color;
+        text.horizontalOverflow = HorizontalWrapMode.Overflow;
+        text.resizeTextForBestFit = false;
+        text.supportRichText = true;
+        foreach (var outline in text.GetComponents<Outline>())
+            outline.enabled = false;
+        text.raycastTarget = false;
+    }
+
+    static Sprite _hudWhitePillSprite;
+    static Sprite _hudStarSprite;
+    static Sprite HudStarSprite
+    {
+        get
+        {
+            if (_hudStarSprite != null) return _hudStarSprite;
+            const int size = 128;
+            var texture = new Texture2D(size, size, TextureFormat.RGBA32, false) { name = "HUD Golden Star" };
+            var vertices = new Vector2[10];
+            for (int i = 0; i < vertices.Length; i++)
+            {
+                float angle = (90f + i * 36f) * Mathf.Deg2Rad;
+                vertices[i] = new Vector2(64f, 64f) + new Vector2(Mathf.Cos(angle), Mathf.Sin(angle)) * (i % 2 == 0 ? 59f : 28f);
+            }
+            var pixels = new Color[size * size];
+            for (int y = 0; y < size; y++)
+            for (int x = 0; x < size; x++)
+            {
+                var point = new Vector2(x + 0.5f, y + 0.5f);
+                bool inside = false;
+                float distance = float.MaxValue;
+                for (int i = 0, j = 9; i < 10; j = i++)
+                {
+                    var a = vertices[i]; var b = vertices[j];
+                    if ((a.y > point.y) != (b.y > point.y) && point.x < (b.x - a.x) * (point.y - a.y) / (b.y - a.y) + a.x)
+                        inside = !inside;
+                    var edge = b - a;
+                    distance = Mathf.Min(distance, Vector2.Distance(point, a + edge * Mathf.Clamp01(Vector2.Dot(point - a, edge) / edge.sqrMagnitude)));
+                }
+                Color fill = Color.Lerp(new Color(1f, 0.47f, 0.015f), new Color(1f, 0.94f, 0.35f), y / 127f);
+                if (distance < 4f) fill = Color.Lerp(new Color(0.9f, 0.39f, 0.01f), new Color(1f, 0.97f, 0.64f), y / 127f);
+                fill.a = Mathf.Clamp01(0.5f + (inside ? distance : -distance));
+                pixels[y * size + x] = fill;
+            }
+            texture.SetPixels(pixels);
+            texture.Apply();
+            _hudStarSprite = Sprite.Create(texture, new Rect(0, 0, size, size), new Vector2(0.5f, 0.5f), 100f);
+            return _hudStarSprite;
+        }
+    }
+
+    static Sprite HudWhitePillSprite
+    {
+        get
+        {
+            if (_hudWhitePillSprite != null) return _hudWhitePillSprite;
+            var source = HudPillSprite.texture;
+            var texture = new Texture2D(source.width, source.height, TextureFormat.RGBA32, false);
+            var pixels = source.GetPixels();
+            for (int i = 0; i < pixels.Length; i++)
+                pixels[i] = new Color(1f, 1f, 1f, pixels[i].a);
+            texture.SetPixels(pixels);
+            texture.Apply();
+            _hudWhitePillSprite = Sprite.Create(texture, new Rect(0, 0, source.width, source.height), new Vector2(0.5f, 0.5f), 100f, 0, SpriteMeshType.FullRect, new Vector4(24, 24, 24, 24));
+            return _hudWhitePillSprite;
+        }
+    }
+
+    static Sprite _hudPillSprite;
+    static Sprite HudPillSprite
+    {
+        get
+        {
+            if (_hudPillSprite != null) return _hudPillSprite;
+            const int size = 64;
+            var texture = new Texture2D(size, size, TextureFormat.RGBA32, false) { name = "HUD Blue Pill" };
+            var pixels = new Color[size * size];
+            const float radius = 30f;
+            for (int y = 0; y < size; y++)
+            for (int x = 0; x < size; x++)
+            {
+                float dx = Mathf.Max(radius - x, 0f, x - (size - 1 - radius));
+                float dy = Mathf.Max(radius - y, 0f, y - (size - 1 - radius));
+                float edge = Mathf.Sqrt(dx * dx + dy * dy) - radius;
+                float sheen = y / (size - 1f);
+                Color fill = Color.Lerp(new Color(0.025f, 0.27f, 0.52f), new Color(0.08f, 0.56f, 0.85f), sheen);
+                if (edge > -2f) fill = Color.Lerp(new Color(0.08f, 0.5f, 0.78f), new Color(0.55f, 0.9f, 1f), sheen);
+                pixels[y * size + x] = new Color(fill.r, fill.g, fill.b, Mathf.Clamp01(0.5f - edge) * 0.94f);
+            }
+            texture.SetPixels(pixels);
+            texture.Apply();
+            _hudPillSprite = Sprite.Create(texture, new Rect(0, 0, size, size), new Vector2(0.5f, 0.5f), 100f, 0, SpriteMeshType.FullRect, new Vector4(30, 30, 30, 30));
+            return _hudPillSprite;
+        }
+    }
+
+    static Sprite _hudCircleSprite;
+    static Sprite HudCircleSprite
+    {
+        get
+        {
+            if (_hudCircleSprite != null) return _hudCircleSprite;
+            const int size = 64;
+            var texture = new Texture2D(size, size, TextureFormat.RGBA32, false) { name = "HUD Circle" };
+            var pixels = new Color[size * size];
+            float center = (size - 1) * 0.5f, radius = size * 0.48f;
+            for (int y = 0; y < size; y++)
+            for (int x = 0; x < size; x++)
+            {
+                float dx = x - center, dy = y - center;
+                float distance = Mathf.Sqrt(dx * dx + dy * dy);
+                Color fill = Color.Lerp(new Color(0.015f, 0.32f, 0.64f), new Color(0.1f, 0.64f, 0.9f), y / (size - 1f));
+                if (distance > radius - 2.5f) fill = new Color(0.42f, 0.87f, 1f);
+                fill.a = Mathf.Clamp01(radius - distance);
+                pixels[y * size + x] = fill;
+            }
+            texture.SetPixels(pixels);
+            texture.Apply();
+            _hudCircleSprite = Sprite.Create(texture, new Rect(0, 0, size, size), new Vector2(0.5f, 0.5f), 100f);
+            return _hudCircleSprite;
+        }
+    }
+
+    static Sprite _hudSpeedometerSprite;
+    static Sprite HudSpeedometerSprite
+    {
+        get
+        {
+            if (_hudSpeedometerSprite != null) return _hudSpeedometerSprite;
+            const int size = 64;
+            var texture = new Texture2D(size, size, TextureFormat.RGBA32, false) { name = "HUD Speedometer Arc" };
+            var pixels = new Color[size * size];
+            float centerX = (size - 1) * 0.5f, centerY = 18f;
+            for (int y = 0; y < size; y++)
+            for (int x = 0; x < size; x++)
+            {
+                float dx = x - centerX, dy = y - centerY;
+                float radius = Mathf.Sqrt(dx * dx + dy * dy);
+                float angle = Mathf.Atan2(dy, dx) * Mathf.Rad2Deg;
+                bool arc = radius >= 25f && radius <= 29f && angle >= 0f && angle <= 180f;
+                float tickAngle = Mathf.Abs(Mathf.DeltaAngle(angle, Mathf.Round(angle / 30f) * 30f));
+                bool tick = radius >= 19f && radius <= 25f && angle >= 0f && angle <= 180f && tickAngle < 4f;
+                var point = new Vector2(dx, dy);
+                var tip = new Vector2(14f, 18f);
+                float along = Mathf.Clamp01(Vector2.Dot(point, tip) / tip.sqrMagnitude);
+                bool needle = (point - tip * along).sqrMagnitude < 3.5f;
+                pixels[y * size + x] = arc || tick || needle || radius < 3f ? Color.white : Color.clear;
+            }
+            texture.SetPixels(pixels);
+            texture.Apply();
+            _hudSpeedometerSprite = Sprite.Create(texture, new Rect(0, 0, size, size), new Vector2(0.5f, 0.5f), 100f);
+            return _hudSpeedometerSprite;
+        }
+    }
+
+    void UpdateSpeedGauge(float speed)
+    {
+        if (_speedGaugeFill == null) return;
+        float speedLimit = _player != null && _player.HasSpeedCap ? _player.MaxRideSpeed * 3.6f : 160f;
+        _speedGaugeFill.fillAmount = Mathf.Clamp01(speed * 3.6f / Mathf.Max(speedLimit, 1f));
+        _speedGaugeFill.color = _player != null && _player.BoostActive
+            ? new Color(1f, 0.62f, 0.12f)
+            : Color.Lerp(new Color(1f, 0.72f, 0.08f), new Color(0.25f, 0.92f, 0.38f), _speedGaugeFill.fillAmount);
+    }
+
+    void OnDestroy()
+    {
+        if (_subscribed && _player != null)
+            _player.PlayReset -= OnPlayReset;
+        if (_paused)
+            Time.timeScale = 1f;
+    }
+
+    void OnPlayReset()
+    {
+        CommitBest();
+        _score = 0f;
+    }
+
+    void CommitBest()
+    {
+        if (_score > _best)
+        {
+            _best = _score;
+            PlayerPrefs.SetFloat(BestKey, _best);
+            PlayerPrefs.Save();
+        }
+    }
+
+    void Update()
+    {
+        if (_player == null)
+            _player = FindFirstObjectByType<PlayerView>();
+        if (_player != null && !_subscribed)
+        {
+            _player.PlayReset += OnPlayReset;
+            _subscribed = true;
+        }
+
+        float multiplier = 1f;
+        float speed = 0f;
+        if (_player != null)
+        {
+            bool riding = _player.IsOnSlide;
+            speed = riding ? _player.RideSpeed : (_player.Rigidbody != null ? _player.Rigidbody.linearVelocity.magnitude : 0f);
+            if (riding)
+            {
+                if (_player.BoostActive)
+                    multiplier = _boostMultiplier;
+                else if (_player.RideSpeed >= (_player.HasSpeedCap ? _player.MaxRideSpeed * _fastFraction : _fastSpeedNoCap))
+                    multiplier = _fastMultiplier;
+                _score += _player.RideSpeed * Time.deltaTime * _pointsPerMeter * multiplier;
+                if (_score > _best)
+                    _best = _score;
+            }
+        }
+
+        int scoreInt = Mathf.FloorToInt(_score);
+        if (_scoreText != null && scoreInt != _shownScore)
+        {
+            _shownScore = scoreInt;
+            _scoreText.text = scoreInt.ToString("N0");
+        }
+        int bestInt = Mathf.FloorToInt(_best);
+        if (_bestText != null && bestInt != _shownBest)
+        {
+            _shownBest = bestInt;
+            _bestText.text = bestInt > 0 ? "РЕКОРД  " + bestInt.ToString("N0") : "";
+        }
+        // Опасность ближайшего поворота: 2 — слишком быстро (красный), 1 — близко к
+        // пределу (предупреждающий цвет), 0 — нормально (цвет по множителю).
+        // Гистерезис 0.08: на границе значение дрожит (0.98 ↔ 1.01 каждый шаг физики),
+        // без него цвет мигал бы.
+        float danger = _player != null ? _player.CornerDanger : 0f;
+        const float Hyst = 0.08f;
+        int dangerStage = _shownDangerStage < 0 ? 0 : _shownDangerStage;
+        float warnOn = _cornerWarnFraction > 0.001f ? _cornerWarnFraction : 1f;
+        if (danger >= 1f)
+            dangerStage = 2;
+        else if (dangerStage == 2 && danger < 1f - Hyst)
+            dangerStage = danger >= warnOn ? 1 : 0;
+        if (dangerStage < 2)
+        {
+            if (danger >= warnOn)
+                dangerStage = 1;
+            else if (dangerStage == 1 && danger < warnOn - Hyst)
+                dangerStage = 0;
+        }
+
+        int kmh = Mathf.RoundToInt(speed * 3.6f);
+        if (_speedText != null && (kmh != _shownSpeed || dangerStage != _shownDangerStage
+            || !Mathf.Approximately(multiplier, _shownMultiplier)))
+        {
+            _shownSpeed = kmh;
+            _shownMultiplier = multiplier;
+            _shownDangerStage = dangerStage;
+            _speedText.text = multiplier > 1.01f ? $"{kmh} <size=26>км/ч  ×{multiplier:0}</size>" : $"{kmh} <size=26>км/ч</size>";
+            _speedText.color = dangerStage == 2 ? _cornerDangerColor
+                : dangerStage == 1 ? _cornerWarnColor
+                : multiplier >= _boostMultiplier - 0.01f ? new Color(1f, 0.85f, 0.2f)
+                : multiplier > 1.01f ? new Color(0.5f, 1f, 0.55f) : Color.white;
+        }
+        UpdateSpeedGauge(speed);
+    }
+
+    void OnApplicationPause(bool pause)
+    {
+        if (pause)
+            CommitBest();
+    }
+
+    void OnApplicationQuit()
+    {
+        CommitBest();
+    }
+}
